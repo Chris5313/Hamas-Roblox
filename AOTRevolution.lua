@@ -2,6 +2,8 @@
 --// Modernized rewrite of aot_v3 (old Rayfield script) on the shared base.
 --// Kept: nape hitbox expander (+streamer mode), auto anti-eat, speed boost,
 --        gas tank teleport, player/titan ESP.
+--// NEW v2.1: FULL AUTO FARM (mission mode) + retry clicker (proven inset-corrected
+--        VIM click on Rewards.Main.Info.Main.Buttons.Retry) + auto reload.
 --// Dropped: remote UI lib, fake map dropdown, dead autoNape vars, per-object
 --        while-loops, duplicate ChildAdded watchers (now delta+pcall everywhere).
 --// Lobby-safe: Titans/Reloads only exist in matches; everything re-scans.
@@ -18,19 +20,22 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "2.0",
+    Version = "2.1",
     Debug = true,
     Tabs = {
-        { Title = "Combat",  Icon = "swords" },
-        { Title = "Visuals", Icon = "eye" },
+        { Title = "Farming",  Icon = "wheat" },
+        { Title = "Combat",   Icon = "swords" },
+        { Title = "Visuals",  Icon = "eye" },
         { Title = "Teleport", Icon = "target" },
     },
 })
-local Fluent, Window, Tabs, Debug = ctx.Fluent, ctx.Window, ctx.Tabs, ctx.Debug
+local Fluent, Window, Tabs, Debug, SaveManager = ctx.Fluent, ctx.Window, ctx.Tabs, ctx.Debug, ctx.SaveManager
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local VIM = game:GetService("VirtualInputManager")
+local GuiService = game:GetService("GuiService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
@@ -215,7 +220,7 @@ local function antiEatStep()
 end
 
 --// ===========================================================================
---// Speed modifier — velocity boost, applied from the Player tab sliders
+--// Speed modifier — velocity boost
 --// ===========================================================================
 local Speed = { Enabled = false, Multiplier = 1 }
 
@@ -238,8 +243,7 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
 end)
 
 --// ===========================================================================
---// Teleport — closest gas tank (recursive; survives map restructures — tanks
---// used to live at Unclimbable.Reloads.GasTanks, now Unclimbable.Props.HQ.GasTanks)
+--// Teleport — closest gas tank (recursive; survives map restructures)
 --// ===========================================================================
 local function findClosestGasTank()
     local char = LocalPlayer.Character
@@ -262,15 +266,12 @@ local function findClosestGasTank()
         if not bestD or d < bestD then best, bestPos, bestD = inst, pos, d end
     end
 
-    --// pass 1: Unclimbable subtree — any Model named exactly "GasTank"
     local U = workspace:FindFirstChild("Unclimbable")
     if U then
         for _, d in ipairs(U:GetDescendants()) do
             if d.Name == "GasTank" and d:IsA("Model") then consider(d) end
         end
     end
-    --// pass 2 (fallback): whole workspace, models then parts, in case a map
-    --// keeps tanks outside Unclimbable or as loose MeshParts
     if not best then
         for _, d in ipairs(workspace:GetDescendants()) do
             if d.Name == "GasTank" then consider(d) end
@@ -281,8 +282,283 @@ local function findClosestGasTank()
 end
 
 --// ===========================================================================
+--// AUTO FARM (mission mode) — the real loop
+--//
+--// Facts this is built on (all verified live, see docs/AOT_AutoFarm_Plan.md):
+--//   * Combat is PHYSICAL: our character's invisible Hitbox part touching the
+--//     titan's Hitboxes/Hit/Nape part = damage. No remote exists for hits.
+--//   * Round-end = #workspace.Titans == 0. Retry = VIM click (inset-corrected)
+--//     on Interface.Rewards.Main.Info.Main.Buttons.Retry -> server hop.
+--//   * After the hop the whole script re-executes (autoexec); farm state is
+--//     persisted to a file so the new server resumes FARMING automatically.
+--//   * ODM module is readable: require(ReplicatedStorage.Modules.Core.ODMG)
+--//     has M1/Hook/Reload. But safest kill method: micro-TP inside nape + M1.
+--// ===========================================================================
+local Farm = {
+    Enabled = false,          -- master switch (persisted across hops via file)
+    Mode = "MicroTP",         -- "MicroTP" (default) | "ODM"
+    GasThreshold = 15,        -- % gas -> go reload
+    AttackHold = 0.25,        -- seconds per swing cycle
+    KillRadiusLimit = 100000, -- target any titan on the map
+    state = "IDLE",           -- IDLE / FARMING / ROUND_END / HOPPING
+}
+
+local FARM_FLAG = "HamasAOT_FarmEnabled.txt"
+
+local function setFarmFlag(v)
+    pcall(function()
+        if v then writefile(FARM_FLAG, "1") else
+            if isfile(FARM_FLAG) then delfile(FARM_FLAG) end
+        end
+    end)
+end
+local function readFarmFlag()
+    local ok, v = pcall(function() return isfile(FARM_FLAG) end)
+    return ok and v or false
+end
+
+--// --- retry clicker (PROVEN: inset-corrected VIM click on the real Retry button)
+local function clickRetry()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local iface = gui and gui:FindFirstChild("Interface")
+    local rewards = iface and iface:FindFirstChild("Rewards")
+    local m1 = rewards and rewards:FindFirstChild("Main")
+    local info = m1 and m1:FindFirstChild("Info")
+    local m2 = info and info:FindFirstChild("Main")
+    local buttons = m2 and m2:FindFirstChild("Buttons")
+    local btn = buttons and buttons:FindFirstChild("Retry")
+    if not (btn and btn:IsA("GuiButton")) then return false, "no retry button" end
+    if not (btn.Visible and btn.AbsoluteSize.X > 0) then return false, "not visible" end
+    local inset = GuiService:GetGuiInset()
+    local p, s = btn.AbsolutePosition, btn.AbsoluteSize
+    local cx = p.X + s.X / 2 + inset.X
+    local cy = p.Y + s.Y / 2 + inset.Y
+    VIM:SendMouseMoveEvent(cx, cy, game)
+    task.wait(0.15)
+    VIM:SendMouseMoveEvent(cx, cy, game)
+    task.wait(0.1)
+    VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
+    task.wait(0.06)
+    VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
+    return true, string.format("clicked %.0f,%.0f", cx, cy)
+end
+
+--// --- titan helpers
+local function liveTitans()
+    local T = workspace:FindFirstChild("Titans")
+    if not T then return {} end
+    local out = {}
+    for _, t in ipairs(T:GetChildren()) do
+        local nape = t:FindFirstChild("Hitboxes")
+        nape = nape and nape:FindFirstChild("Hit")
+        nape = nape and nape:FindFirstChild("Nape")
+        if nape and nape:IsA("BasePart") and nape.Transparency < 1 then
+            out[#out + 1] = t
+        end
+    end
+    return out
+end
+
+local function nearestTitan()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local best, bestD
+    for _, t in ipairs(liveTitans()) do
+        local nape = t.Hitboxes.Hit.Nape
+        local d = (nape.Position - hrp.Position).Magnitude
+        if not bestD or d < bestD then best, bestD = t, d end
+    end
+    return best, bestD
+end
+
+--// --- movement: micro-TP toward a point above the nape (drops us onto it)
+local function tpNearNape(titan)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local nape = titan and titan:FindFirstChild("Hitboxes")
+    nape = nape and nape:FindFirstChild("Hit")
+    nape = nape and nape:FindFirstChild("Nape")
+    if not (hrp and nape) then return false end
+    local pos = nape.Position + Vector3.new(0, math.max(6, nape.Size.Y / 2 + 3), 0)
+    hrp.CFrame = CFrame.lookAt(pos, Vector3.new(nape.Position.X, pos.Y, nape.Position.Z))
+    return true
+end
+
+--// --- attack: swing via the game's own M1, fallback VIM mouse click
+local ODMG
+pcall(function() ODMG = require(ReplicatedStorage.Modules.Core.ODMG) end)
+
+local function swing()
+    local did = false
+    if ODMG and type(ODMG.M1) == "function" then
+        local ok, err = pcall(ODMG.M1)
+        did = ok
+        if not ok and Debug then Debug:Log("[Farm] M1 err:", tostring(err):sub(1, 60)) end
+    end
+    if not did then
+        -- fallback: real mouse click at screen center (game reads real input)
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize
+        if vp then
+            local cx, cy = vp.X / 2, vp.Y / 2
+            VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
+            task.wait(0.05)
+            VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
+        end
+    end
+end
+
+--// --- gas / blade discipline
+local function gasPercent()
+    local ok, v = pcall(function()
+        local pl = LocalPlayer
+        if pl:GetAttribute("Gas") then return pl:GetAttribute("Gas") end
+        local pg = pl:FindFirstChildOfClass("PlayerGui")
+        local iface = pg and pg:FindFirstChild("Interface")
+        local hud = iface and iface:FindFirstChild("HUD")
+        local gas = hud and hud:FindFirstChild("Main")
+        gas = gas and gas:FindFirstChild("Top")
+        gas = gas and gas:FindFirstChild("7")
+        gas = gas and gas:FindFirstChild("Gas")
+        local pct = gas and gas:FindFirstChild("Percentage")
+        local n = pct and tonumber((pct.Text:gsub("%%", "")))
+        return n
+    end)
+    return ok and v or 100
+end
+
+local function bladeSets()
+    local ok, cur = pcall(function()
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local iface = pg and pg:FindFirstChild("Interface")
+        local hud = iface and iface:FindFirstChild("HUD")
+        local blades = hud and hud:FindFirstChild("Main")
+        blades = blades and blades:FindFirstChild("Top")
+        blades = blades and blades:FindFirstChild("7")
+        blades = blades and blades:FindFirstChild("Blades")
+        local sets = blades and blades:FindFirstChild("Sets")
+        return tonumber((sets.Text:match("^(%d+) / ")))
+    end)
+    if ok and cur ~= nil then return cur end
+    return 99 -- unknown = assume fine
+end
+
+local function needReload()
+    if gasPercent() < Farm.GasThreshold then return "gas" end
+    if bladeSets() <= 1 then return "blades" end
+    return nil
+end
+
+local function doReload()
+    -- R keypress = the game's reload bind; then wait for sets to come back
+    pcall(function()
+        VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+        task.wait(0.05)
+        VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+    end)
+    for _ = 1, 8 do
+        task.wait(0.5)
+        if not needReload() then break end
+    end
+end
+
+--// --- the loop
+task.spawn(function()
+    while true do
+        task.wait(0.4)
+        if Farm.Enabled then
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if not (char and hum and hum.Health > 0) then
+                Farm.state = "DEAD"
+                continue
+            end
+
+            local titans = liveTitans()
+            if #titans == 0 then
+                -- round end (or lobby) -> press retry on the completed screen
+                Farm.state = "ROUND_END"
+                task.wait(1.5) -- let the rewards panel animate in
+                local ok, msg = clickRetry()
+                if Debug and not ok then Debug:Log("[Farm] retry:", msg) end
+                task.wait(2)
+                -- wait out the hop: our loop dies with the server; the flag file
+                -- re-arms the farm after autoexec re-runs the script in the new server
+                for _ = 1, 30 do
+                    task.wait(1)
+                    if #liveTitans() > 0 then break end
+                end
+            else
+                Farm.state = "FARMING"
+                -- resource discipline first
+                local need = needReload()
+                if need == "gas" then
+                    Farm.state = "RELOADING"
+                    local tank, pos = findClosestGasTank()
+                    local hrp = char:FindFirstChild("HumanoidRootPart")
+                    if tank and hrp then
+                        hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+                        task.wait(0.5)
+                    end
+                    doReload()
+                elseif need == "blades" then
+                    Farm.state = "RELOADING"
+                    doReload()
+                else
+                    -- attack cycle
+                    local target, dist = nearestTitan()
+                    if target then
+                        if dist > 30 or not LocalPlayer.Character:FindFirstChild("Hitbox") then
+                            tpNearNape(target)
+                            task.wait(0.15)
+                        end
+                        -- small settle so physics sees us inside the nape volume
+                        local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                        if hrp then
+                            for _ = 1, 3 do
+                                swing()
+                                task.wait(Farm.AttackHold)
+                                -- re-check: nape still alive?
+                                local nape = target:FindFirstChild("Hitboxes")
+                                nape = nape and nape:FindFirstChild("Hit")
+                                nape = nape and nape:FindFirstChild("Nape")
+                                if not (nape and nape.Parent) then break end
+                            end
+                        end
+                    end
+                end
+            end
+        elseif Farm.state ~= "IDLE" then
+            Farm.state = "IDLE"
+        end
+    end
+end)
+
+local function setFarm(v)
+    Farm.Enabled = v and true or false
+    setFarmFlag(Farm.Enabled)
+    if Debug then Debug:Log("[Farm]", Farm.Enabled and "ON" or "OFF") end
+    Fluent:Notify({ Title = "HamasClient", Content = Farm.Enabled and "Auto farm ON — killing + auto-retry" or "Auto farm OFF", Duration = 2 })
+end
+
+-- resume automatically after the retry server-hop re-executes the script
+if readFarmFlag() and not Farm.Enabled then
+    task.delay(3, function() setFarm(true) end)
+end
+
+--// ===========================================================================
 --// UI
 --// ===========================================================================
+local F = Tabs.Farming
+F:CreateSection("Auto Farm (Missions)")
+F:CreateToggle("AOT_FarmMaster", { Title = "Auto Farm", Description = "Kill all titans -> auto-retry next mission", Default = false,
+    Callback = setFarm })
+F:CreateDropdown("AOT_FarmMode", { Title = "Attack Mode", Default = "MicroTP", Options = { "MicroTP", "ODM" },
+    Callback = function(v) Farm.Mode = v end })
+F:CreateSlider("AOT_FarmGas", { Title = "Refill below gas %", Default = 15, Min = 5, Max = 50, Rounding = 0,
+    Callback = function(v) Farm.GasThreshold = v end })
+
 local C = Tabs.Combat
 C:CreateSection("Nape Hitbox")
 C:CreateToggle("AOT_Nape", { Title = "Expand Nape Hitboxes", Default = false,
@@ -322,8 +598,7 @@ TP:CreateButton({ Title = "Teleport to closest Gas Tank",
         if hrp then
             local target = pos + Vector3.new(0, 3, 0)
             hrp.CFrame = CFrame.new(target)
-            local RS = game:GetService("ReplicatedStorage")
-            local rem = RS:FindFirstChild("Assets") and RS.Assets:FindFirstChild("Remotes")
+            local rem = ReplicatedStorage:FindFirstChild("Assets") and ReplicatedStorage.Assets:FindFirstChild("Remotes")
             local POST = rem and rem:FindFirstChild("POST")
             if POST then
                 local ok = pcall(function() POST:FireServer(target) end)
@@ -364,6 +639,7 @@ getgenv().HamasAOT_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
     Speed.Enabled = false
     AntiEat.Enabled = false
+    Farm.Enabled = false
 end
 
 print("[Hamas] AOT Revolution loaded, place:", game.PlaceId)
