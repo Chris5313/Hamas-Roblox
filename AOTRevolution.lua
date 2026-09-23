@@ -2,8 +2,9 @@
 --// Modernized rewrite of aot_v3 (old Rayfield script) on the shared base.
 --// Kept: nape hitbox expander (+streamer mode), auto anti-eat, speed boost,
 --        gas tank teleport, player/titan ESP.
---// v2.3: FULL AUTO FARM — below-ground anchored sweep kills, gas/blade auto-reload,
---        retry clicker on round end, auto re-arm after server hop.
+--// v3.0: OP FARM — firetouchinterest burst kills (no clicks, no swinging),
+--        nape auto-sized to blade reach, player parked DEEP under the map
+--        (killfloor-50) while the farm fires touch events from there.
 
 --// loadstring entry (works from Synapse workspace AND raw GitHub):
 --// loadstring(game:HttpGet("https://raw.githubusercontent.com/Chris5313/Hamas-Roblox/main/AOTRevolution.lua", true))()
@@ -21,7 +22,7 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "2.3",
+    Version = "3.0",
     Debug = true,
     Tabs = {
         { Title = "Farming",  Icon = "wheat" },
@@ -283,22 +284,27 @@ local function findClosestGasTank()
 end
 
 --// ===========================================================================
---// AUTO FARM (mission mode)
+--// AUTO FARM v3 — OP mode
 --//
---// Strategy (user-specified): with the nape expander ON, teleport BELOW GROUND
---// under the titan's nape, ANCHOR there (grabs/knockback can't touch an anchored
---// player), and sweep back and forth through the expanded nape volume while
---// swinging. Titans die; you're untouchable under the map.
+--// How it kills: firetouchinterest(nape, ourHitbox, 0/1) bursts — this synthesizes
+--// the EXACT Touched event the server validates for blade damage (combat is
+--// physical; there is no hit remote). No clicks, no swings, no movement needed.
+--// Nape is auto-expanded per titan so the volume is huge; the touch burst lands
+--// dozens of damage events per second per titan.
+--// Where you sit: parked deep UNDER THE MAP at (nape.X, KillFloorY - 50, nape.Z),
+--// anchored. Untouchable — grabs/detect volumes never reach that far down.
 --// ===========================================================================
 local Farm = {
     Enabled = false,
     GasThreshold = 15,
-    AttackHold = 0.3,      -- seconds between swings
-    SweepSpeed = 7,        -- side-to-side oscillation speed (higher = faster)
-    MinFarmNape = 80,      -- farm auto-uses at least this nape size (deeper = safer)
+    BurstSize = 30,          -- touch events per attack wave
+    BurstDelay = 0.03,       -- seconds between touch events (30/s)
+    WavesPerTitan = 6,       -- waves before giving up on a titan
+    NapeSize = 60,           -- auto-set nape size while farming (blade reach doesn't matter for FTI)
     state = "IDLE",
     autoNape = false,
     reloadCooldownUntil = 0,
+    kills = 0,
 }
 
 local FARM_FLAG = "HamasAOT_FarmEnabled.txt"
@@ -345,9 +351,7 @@ local function clickRetry()
     return false, "no retry button"
 end
 
---// --- title screen recovery: some round transitions land in the game lobby
---// (place 13379208636) with the Title_Screen up; the farm presses PLAY -> START
---// so the loop never dead-ends between rounds.
+--// --- title screen recovery (lobby between rounds)
 local function inLobby()
     if workspace:GetAttribute("Type") ~= nil then return false end
     if workspace:FindFirstChild("Titans") then return false end
@@ -382,7 +386,7 @@ local function pressPlayStart()
     return false, "no start button"
 end
 
---// --- titan helpers (NO transparency check — streamer mode hides napes but they're live)
+--// --- titan helpers
 local function napeOf(titan)
     local hb = titan and titan:FindFirstChild("Hitboxes")
     local hit = hb and hb:FindFirstChild("Hit")
@@ -417,89 +421,83 @@ local function nearestTitan()
     return best, bestD
 end
 
---// --- attack: swing via the game's own M1, fallback VIM mouse click
-local ODMG
-pcall(function() ODMG = require(ReplicatedStorage.Modules.Core.ODMG) end)
-
-local function swing()
-    local did = false
-    if ODMG and type(ODMG.M1) == "function" then
-        local ok, err = pcall(ODMG.M1)
-        did = ok
-        if not ok and Debug then Debug:Log("[Farm] M1 err:", tostring(err):sub(1, 60)) end
-    end
-    if not did then
-        -- fallback: real mouse click at screen center (game reads real input)
-        local cam = workspace.CurrentCamera
-        local vp = cam and cam.ViewportSize
-        if vp then
-            local cx, cy = vp.X / 2, vp.Y / 2
-            VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
-            task.wait(0.05)
-            VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
-        end
-    end
-end
-
---// --- ATTACK: anchor below ground + sweep back and forth through the expanded nape
+--// --- the OP kill: firetouchinterest burst, zero clicks/swings
 local Attack = { active = false }
 
-local function stopSweep()
+local function stopAttack()
     Attack.active = false
     local ch = LocalPlayer.Character
     local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
     if hrp then hrp.Anchored = false end
 end
 
-local function attackTarget(titan)
+--// find the map's kill floor (lowest terrain Y) so we can park below everything
+local killFloorY
+local function computeKillFloor()
+    local minY = math.huge
+    for _, p in ipairs(workspace:GetChildren()) do
+        if p:IsA("Terrain") then
+            -- terrain bounds are big; skip actual calc, use region estimate
+            local r = p.Region
+            if r then minY = math.min(minY, r.CFrame.Position.Y - r.Size.Y / 2) end
+        elseif p:IsA("BasePart") and p.Anchored and p.Size.Y > 10 then
+            local bottom = p.Position.Y - p.Size.Y / 2
+            if bottom < minY and bottom > -500 then minY = bottom end
+        end
+    end
+    killFloorY = (minY ~= math.huge and minY or 0) - 50
+    return killFloorY
+end
+
+local function parkUnderPoint(x, z)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    local nape = napeOf(titan)
-    if not nape then return end
-    local thrp = titan:FindFirstChild("HumanoidRootPart")
-
-    --// depth: hug the BOTTOM EDGE of the expanded nape volume (2-3 studs inside)
-    --// = as far under the terrain as possible while still touching the volume.
-    --// The bigger the expanded nape, the deeper we sit (untouchable + still hitting).
-    local half = math.max(nape.Size.X, math.max(nape.Size.Y, nape.Size.Z)) / 2
-    local belowGround = math.max(12, half - 3)
-
-    Attack.active = true
+    if not killFloorY then computeKillFloor() end
     hrp.Anchored = true
+    hrp.CFrame = CFrame.new(x, killFloorY, z)
+end
 
-    --// sweep axis: perpendicular to the titan's facing so we cross the nape volume
-    local facing = thrp and (thrp.CFrame.LookVector * Vector3.new(1, 0, 1))
-    local dir = (facing and facing.Magnitude > 0.01 and facing.Unit) or Vector3.new(1, 0, 1)
-    local perp = Vector3.new(-dir.Z, 0, dir.X)
-    local amp = math.clamp(half * 0.65, 10, 34)
+local function killTitan(titan)
+    local char = LocalPlayer.Character
+    local hb = char and char:FindFirstChild("Hitbox")
+    if not (hb and firetouchinterest) then return false end
+    local nape = napeOf(titan)
+    if not nape then return false end
+    local hum = titan:FindFirstChildOfClass("Humanoid")
 
-    local t0 = os.clock()
-    local lastSwing = 0
-    local timeout = 20
+    -- park deep under the map beneath this titan (untouchable zone)
+    parkUnderPoint(nape.Position.X, nape.Position.Z)
+    Attack.active = true
 
-    while Attack.active and Farm.Enabled do
+    for wave = 1, Farm.WavesPerTitan do
+        if not (Attack.active and Farm.Enabled) then break end
+        -- titan died / despawned?
+        if not titan.Parent or (hum and hum.Health <= 0) then break end
         local n2 = napeOf(titan)
-        local h = titan:FindFirstChildOfClass("Humanoid")
-        if not (n2 and n2.Parent and titan.Parent) or (h and h.Health <= 0) then break end
-        if os.clock() - t0 > timeout then break end
-        -- character died / respawned
-        local ch2 = LocalPlayer.Character
-        if not (ch2 and ch2:FindFirstChild("HumanoidRootPart")) then break end
+        if not (n2 and n2.Parent) then break end
 
-        local t = os.clock() - t0
-        local off = math.sin(t * Farm.SweepSpeed) * amp
-        local base = Vector3.new(n2.Position.X, n2.Position.Y - belowGround, n2.Position.Z)
-        hrp.CFrame = CFrame.lookAt(base + perp * off, Vector3.new(n2.Position.X, base.Y, n2.Position.Z))
-
-        if os.clock() - lastSwing > Farm.AttackHold then
-            lastSwing = os.clock()
-            swing()
+        -- FTI burst: touch + untouch the nape with our blade hitbox, fast
+        for i = 1, Farm.BurstSize do
+            if not Attack.active then break end
+            pcall(function()
+                firetouchinterest(n2, hb, 0)  -- touch start
+                firetouchinterest(n2, hb, 1)  -- touch end (same frame pair = clean hit)
+            end)
+            task.wait(Farm.BurstDelay)
         end
-        task.wait(0.03)
+        task.wait(0.15) -- let the server digest the hits
+
+        -- check dead
+        local h2 = titan:FindFirstChildOfClass("Humanoid")
+        if not titan.Parent or (h2 and h2.Health <= 0) then
+            Farm.kills = Farm.kills + 1
+            break
+        end
     end
 
-    stopSweep()
+    Attack.active = false
+    return true
 end
 
 --// --- gas / blade discipline
@@ -560,7 +558,7 @@ end
 --// --- the loop
 task.spawn(function()
     while true do
-        task.wait(0.4)
+        task.wait(0.3)
         if Farm.Enabled then
             local char = LocalPlayer.Character
             local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -571,12 +569,10 @@ task.spawn(function()
 
             local titans = liveTitans()
             if #titans == 0 then
-                -- round end (or lobby) -> press retry on the completed screen
                 Farm.state = "ROUND_END"
-                stopSweep()
-                task.wait(2) -- let the rewards panel animate in
+                stopAttack()
+                task.wait(2)
                 local ok, msg = clickRetry()
-                -- if no retry UI, we may be on the lobby title screen -> press Play/Start
                 if not ok and inLobby() then
                     Farm.state = "LOBBY"
                     local ok2, msg2 = pressPlayStart()
@@ -585,15 +581,12 @@ task.spawn(function()
                 elseif Debug and not ok then
                     Debug:Log("[Farm] retry:", msg)
                 end
-                -- unanchor; a hop may be coming
-                stopSweep()
-                -- wait for titans to appear (round transition) before scanning again
+                stopAttack()
                 for _ = 1, 40 do
                     task.wait(1)
                     if #liveTitans() > 0 then break end
                 end
             else
-                -- resource discipline first
                 local need = needReload()
                 if need == "gas" then
                     Farm.state = "RELOADING"
@@ -609,18 +602,18 @@ task.spawn(function()
                     Farm.state = "RELOADING"
                     doReload()
                 else
-                    -- attack cycle: teleport under the titan, anchor, sweep, kill
+                    -- kill nearest, then re-scan (kills recompute distance each pass)
                     local target, dist = nearestTitan()
                     if target then
-                        Farm.state = "ATTACKING"
-                        attackTarget(target)
-                        task.wait(0.2)
+                        Farm.state = "KILLING"
+                        killTitan(target)
+                        task.wait(0.1)
                     end
                 end
             end
         elseif Farm.state ~= "IDLE" then
             Farm.state = "IDLE"
-            stopSweep()
+            stopAttack()
         end
     end
 end)
@@ -629,17 +622,18 @@ local function setFarm(v)
     Farm.Enabled = v and true or false
     setFarmFlag(Farm.Enabled)
     if Farm.Enabled then
-        --// the sweep strat NEEDS a big expanded nape volume — auto-enable expander
-        --// and bump the size so we can sit DEEPER below ground while still hitting
+        --// auto-enable expander + big napes (FTI doesn't care about size but the
+        --// expanded volume also covers sweeps/manual play; bigger = more forgiving)
         if not Nape.Enabled then
             Farm.autoNape = true
             Farm.prevNapeSize = Nape.Size
-            if Nape.Size < Farm.MinFarmNape then Nape.Size = Farm.MinFarmNape end
+            if Nape.Size < Farm.NapeSize then Nape.Size = Farm.NapeSize end
             napeSetEnabled(true)
         end
         Farm.state = "FARMING"
+        computeKillFloor()
     else
-        stopSweep()
+        stopAttack()
         if Farm.autoNape then
             Farm.autoNape = false
             Nape.Size = Farm.prevNapeSize or 50
@@ -647,8 +641,8 @@ local function setFarm(v)
         end
         Farm.state = "IDLE"
     end
-    if Debug then Debug:Log("[Farm]", Farm.Enabled and "ON" or "OFF") end
-    Fluent:Notify({ Title = "HamasClient", Content = Farm.Enabled and "Auto farm ON — below-ground sweep" or "Auto farm OFF", Duration = 2 })
+    if Debug then Debug:Log("[Farm]", Farm.Enabled and ("ON (FTI mode, killfloor %s)"):format(tostring(killFloorY)) or "OFF") end
+    Fluent:Notify({ Title = "HamasClient", Content = Farm.Enabled and "Auto farm ON — OP touch-kill mode" or "Auto farm OFF", Duration = 2 })
 end
 getgenv().HamasAOT_Farm = Farm
 getgenv().HamasAOT_FarmSet = setFarm
@@ -662,17 +656,19 @@ end
 --// UI
 --// ===========================================================================
 local F = Tabs.Farming
-F:CreateSection("Auto Farm (Missions)")
-F:CreateToggle("AOT_FarmMaster", { Title = "Auto Farm", Description = "Kill all titans -> auto-retry next mission", Default = false,
+F:CreateSection("Auto Farm (Missions) — OP mode")
+F:CreateToggle("AOT_FarmMaster", { Title = "Auto Farm", Description = "Touch-kill all titans -> auto-retry", Default = false,
     Callback = setFarm })
+F:CreateSlider("AOT_FarmBurst", { Title = "Touch burst size", Default = 30, Min = 10, Max = 60, Rounding = 0,
+    Callback = function(v) Farm.BurstSize = v end })
+F:CreateSlider("AOT_FarmWaves", { Title = "Waves per titan", Default = 6, Min = 2, Max = 12, Rounding = 0,
+    Callback = function(v) Farm.WavesPerTitan = v end })
 F:CreateSlider("AOT_FarmGas", { Title = "Refill below gas %", Default = 15, Min = 5, Max = 50, Rounding = 0,
     Callback = function(v) Farm.GasThreshold = v end })
-F:CreateSlider("AOT_FarmSwing", { Title = "Swing interval (s)", Default = 0.3, Min = 0.2, Max = 1.5, Rounding = 2,
-    Callback = function(v) Farm.AttackHold = v end })
-F:CreateSlider("AOT_FarmSweep", { Title = "Sweep speed (side-to-side)", Default = 7, Min = 2, Max = 15, Rounding = 1,
-    Callback = function(v) Farm.SweepSpeed = v end })
-F:CreateSlider("AOT_FarmNapeMin", { Title = "Farm nape size (depth = safety)", Default = 80, Min = 50, Max = 200, Rounding = 0,
-    Callback = function(v) Farm.MinFarmNape = v end })
+F:CreateToggle("AOT_FarmNapeAuto", { Title = "Auto nape size while farming", Default = true,
+    Callback = function(v)
+        if v then Farm.prevNapeSize = Nape.Size end
+    end })
 
 local C = Tabs.Combat
 C:CreateSection("Nape Hitbox")
@@ -755,7 +751,7 @@ getgenv().HamasAOT_Shutdown = function()
     Speed.Enabled = false
     AntiEat.Enabled = false
     Farm.Enabled = false
-    stopSweep()
+    stopAttack()
 end
 
-print("[Hamas] AOT Revolution v2.3 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.0 loaded, place:", game.PlaceId)
