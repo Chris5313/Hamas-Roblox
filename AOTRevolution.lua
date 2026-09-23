@@ -238,32 +238,46 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
 end)
 
 --// ===========================================================================
---// Teleport — closest gas tank (match only; robust nested search)
+--// Teleport — closest gas tank (recursive; survives map restructures — tanks
+--// used to live at Unclimbable.Reloads.GasTanks, now Unclimbable.Props.HQ.GasTanks)
 --// ===========================================================================
 local function findClosestGasTank()
-    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil end
-    local U = workspace:FindFirstChild("Unclimbable")
-    local R = U and U:FindFirstChild("Reloads")
-    if not R then return nil end
-    local best, bestD
+
+    local best, bestPos, bestD
     local function consider(inst)
-        local pos = inst:IsA("Model") and inst:GetPivot().Position or inst.Position
+        local pos
+        if inst:IsA("Model") then
+            local ok, cf = pcall(inst.GetPivot, inst)
+            if not ok then return end
+            pos = cf.Position
+        elseif inst:IsA("BasePart") then
+            pos = inst.Position
+        else
+            return
+        end
         local d = (pos - hrp.Position).Magnitude
-        if not bestD or d < bestD then best, bestD = inst, d end
+        if not bestD or d < bestD then best, bestPos, bestD = inst, pos, d end
     end
-    for _, item in ipairs(R:GetChildren()) do
-        if item.Name == "GasTanks" then
-            if item:IsA("Model") then
-                consider(item)
-            elseif item:IsA("Folder") then
-                for _, tank in ipairs(item:GetChildren()) do
-                    if tank:IsA("Model") or tank:IsA("BasePart") then consider(tank) end
-                end
-            end
+
+    --// pass 1: Unclimbable subtree — any Model named exactly "GasTank"
+    local U = workspace:FindFirstChild("Unclimbable")
+    if U then
+        for _, d in ipairs(U:GetDescendants()) do
+            if d.Name == "GasTank" and d:IsA("Model") then consider(d) end
         end
     end
-    return best, bestD
+    --// pass 2 (fallback): whole workspace, models then parts, in case a map
+    --// keeps tanks outside Unclimbable or as loose MeshParts
+    if not best then
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d.Name == "GasTank" then consider(d) end
+        end
+    end
+    if best then return best, bestPos, bestD end
+    return nil
 end
 
 --// ===========================================================================
@@ -295,24 +309,39 @@ C:CreateToggle("AOT_AntiEat", { Title = "Auto Struggle (anti-eat)", Default = fa
 local TP = Tabs.Teleport
 TP:CreateSection("Locations")
 TP:CreateButton({ Title = "Teleport to closest Gas Tank",
-    Description = "Match only — refills blades",
+    Description = "Refills blades — works in lobby HQ and matches",
     Callback = function()
-        local tank = findClosestGasTank()
+        local tank, pos, dist = findClosestGasTank()
         if not tank then
-            Fluent:Notify({ Title = "HamasClient", Content = "No gas tanks here (are you in a match?)", Duration = 3 })
+            Fluent:Notify({ Title = "HamasClient", Content = "No gas tanks found anywhere", Duration = 3 })
+            if Debug then Debug:Log("[TP] no GasTank models in workspace") end
             return
         end
-        local pos = tank:IsA("Model") and tank:GetPivot().Position or tank.Position
-        local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if hrp then
-            hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+            local target = pos + Vector3.new(0, 3, 0)
+            hrp.CFrame = CFrame.new(target)
             local RS = game:GetService("ReplicatedStorage")
             local rem = RS:FindFirstChild("Assets") and RS.Assets:FindFirstChild("Remotes")
             local POST = rem and rem:FindFirstChild("POST")
-            pcall(function() POST:FireServer(pos + Vector3.new(0, 3, 0)) end)
-            Fluent:Notify({ Title = "HamasClient", Content = "Teleported to gas tank", Duration = 2 })
+            if POST then
+                local ok = pcall(function() POST:FireServer(target) end)
+                if Debug then Debug:Log("[TP] POST sync:", ok and "ok" or "failed") end
+            end
+            Fluent:Notify({ Title = "HamasClient", Content = string.format("Teleported to gas tank (%dm)", math.floor(dist + 0.5)), Duration = 2 })
+            if Debug then Debug:Log("[TP] gas tank @", tank:GetFullName(), string.format("%.0fm", dist)) end
         end
     end })
+getgenv().HamasAOT_TeleportGas = function()
+    local tank, pos, dist = findClosestGasTank()
+    if not tank then return "no tank" end
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return "no hrp" end
+    hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+    return string.format("tp %.0fm", dist)
+end
 
 local P = Tabs.Combat
 P:CreateSection("Movement")
