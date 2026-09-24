@@ -6,6 +6,16 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.28: EDGE HITS ONLY — YOUR OWN DISCOVERY, NOW THE MECHANISM. "if you try
+--//        to swing while inside the hitboxes it doesn't count, you need to hit
+--//        the edge." That is how Touched works: transitions only, a blade
+--//        buried in the box never re-fires it — which is why ~2 of every 3
+--//        swings were wasted. Three changes: the nape box now ends 2 studs
+--//        ABOVE the lane so the blade straddles its shell (exact reach, the
+--//        +12 fudge is gone), the lane bobs ±2.5 studs so the blade physically
+--//        crosses the edge twice per 1.4s, and every trigger swing now carries
+--//        its own end->begin touch transition 40ms in. No damage spoofing —
+--//        the same real contact the game already accepts, delivered on time.
 --// v3.27: THE OUTSKIRTS BLIND SPOT. "when im really far out it says theres no
 --//        blade refills but there is": Roblox streaming keeps far parts out of
 --//        the client until you get close, so the live scan honestly sees
@@ -1840,7 +1850,13 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt)
     if along >= reach then Sweep.side = -1 elseif along <= -reach then Sweep.side = 1 end
 
     local step = Farm.PassSpeed * math.min(dt, 0.05) * Sweep.side
-    local nextPos = Vector3.new(pos.X + Sweep.axis.X * step, center.Y, pos.Z + Sweep.axis.Z * step)
+    --// v3.28: EDGE BOB. The nape box now ends 2 studs above the lane (exact
+    --// reach), so a gentle ±2.5-stud sine makes the blade physically CROSS the
+    --// bottom shell twice per 1.4s — real transitions at the EDGE, which is
+    --// where hits count. Horizontal speed (what the damage check reads) keeps
+    --// its full 240 studs/s; the bob only rides on top.
+    local bobY = center.Y + 2.5 * math.sin((os.clock() % 1.4) * 2 * math.pi / 1.4)
+    local nextPos = Vector3.new(pos.X + Sweep.axis.X * step, bobY, pos.Z + Sweep.axis.Z * step)
     hrp.Anchored = false
     hrp.CFrame = CFrame.new(nextPos) * (hrp.CFrame - hrp.CFrame.Position)
     --// the replicated velocity is what the server's check reads: report the lane
@@ -2022,6 +2038,18 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     elseif not gearReady() then
         Trigger.heldBack = Trigger.heldBack + 1
     else
+        --// v3.28: FRESH EDGE CONTACT, SYNCED TO THE SWING. Touched fires on
+        --// transitions only, so a swing thrown from deep inside the box is
+        --// wasted (your finding). End the stale touch, throw the swing, and
+        --// deliver a brand-new begin-touch 40ms in — inside the swing window,
+        --// at full blade speed. Every swing now rides its own edge contact.
+        local napF = Sweep.titan and napeOf(Sweep.titan)
+        if napF and napF.Parent and blade and blade.Parent and firetouchinterest then
+            pcall(function() firetouchinterest(napF, blade, 1) end)
+            task.delay(0.04, function()
+                pcall(function() firetouchinterest(napF, blade, 0) end)
+            end)
+        end
         --// FIRE through the host-aware swing, which presses AND releases. This
         --// used to call action("Slash", true) — the entry that is a proven no-op
         --// (205 fires, zero swings), so the triggerbot was firing at nothing.
@@ -2101,7 +2129,11 @@ end
 --// stops, napeFarmRelease() hands the expander back: off, original sizes.
 local napeGrowAt = 0
 local function ensureNapeReach(nape, wantY)
-    local need = math.ceil((nape.Position.Y - wantY) * 2 + 12)
+    --// v3.28: EXACT REACH. The old +12 fudge buried the box's bottom edge 6 studs
+    --// BELOW us, i.e. our blade sat deep inside the volume — and your own testing
+    --// proved swings from inside don't count, only edge hits do. The box now ends
+    --// 2 studs above the lane, so the blade straddles the bottom shell.
+    local need = math.max(10, math.ceil((nape.Position.Y - wantY) * 2) - 4)
     if need <= (Nape.Size or 0) then return Nape.Size end
     if Farm.Enabled and Nape.farmOwned then
         local newSize = math.min(need, NAPE_MAX_SIZE)
@@ -2243,12 +2275,15 @@ local function underAttack(titan, seconds)
             end)
         end
 
-        --// a synthesized touch pair every frame on top of the real overlap
+        --// v3.28: ALTERNATING end/begin touches instead of a same-frame blip.
+        --// Touched only fires on TRANSITIONS: a blade already inside the box
+        --// never re-triggers it (your finding — inside swings don't count, only
+        --// the edge). Alternating end->begin every 0.1s hands the game a fresh
+        --// edge-contact event at full blade speed, continuously.
         if blade and blade.Parent and firetouchinterest then
-            pcall(function()
-                firetouchinterest(cur, blade, 0)
-                firetouchinterest(cur, blade, 1)
-            end)
+            Trigger.burstFlip = not Trigger.burstFlip
+            local phase = Trigger.burstFlip and 1 or 0
+            pcall(function() firetouchinterest(cur, blade, phase) end)
         end
         task.wait(0.05)
     end
@@ -3355,7 +3390,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.27 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.28 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.27 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.28 loaded", Duration = 3 })
 end)
