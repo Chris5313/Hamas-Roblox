@@ -6,6 +6,11 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.27: THE OUTSKIRTS BLIND SPOT. "when im really far out it says theres no
+--//        blade refills but there is": Roblox streaming keeps far parts out of
+--//        the client until you get close, so the live scan honestly sees
+--//        nothing. Every supply position ever seen this session is now
+--//        remembered and used as a fallback when the scan comes up empty.
 --// v3.26: AUTO REFILL, AT LAST. "theres no auto refill look im 0/3 blades" —
 --//        the reserve (HUD n/m) is your stock of fresh blade SETS: a reload
 --//        SPENDS one, the supply station refills it, and only GAS had an
@@ -710,6 +715,18 @@ local function looksLikeSupply(name)
     return false
 end
 
+--// v3.27: every supply position seen this session. Roblox STREAMING keeps far
+--// parts out of the client until you get close — so from the outskirts the
+--// scan honestly sees nothing. Once seen, never forgotten: the map is static.
+local supplyMemory = {}
+local function rememberSupply(name, pos)
+    for _, e in ipairs(supplyMemory) do
+        if (e.pos - pos).Magnitude < 4 then return end
+    end
+    supplyMemory[#supplyMemory + 1] = { name = tostring(name), pos = pos }
+    if #supplyMemory > 20 then table.remove(supplyMemory, 1) end
+end
+
 local function findClosestSupply()
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -728,6 +745,7 @@ local function findClosestSupply()
         end
         local d = (pos - hrp.Position).Magnitude
         if not bestD or d < bestD then best, bestPos, bestD = inst, pos, d end
+        rememberSupply(inst.Name, pos)
     end
     local function scan(root)
         if not root then return end
@@ -742,6 +760,20 @@ local function findClosestSupply()
     local U = workspace:FindFirstChild("Unclimbable")
     scan(U)
     if not best then scan(workspace) end
+    --// v3.27: STREAMING FALLBACK. Live scan empty + a remembered position =
+    --// use it (nearest first). A stand-in table carries the name, since callers
+    --// only read .Name off the result.
+    if not best and #supplyMemory > 0 then
+        local bd, bname
+        for _, e in ipairs(supplyMemory) do
+            local d = (e.pos - hrp.Position).Magnitude
+            if not bd or d < bd then best, bestPos, bestD, bname = { Name = e.name }, e.pos, d, e.name end
+        end
+        if Debug and best then
+            Debug:Log("[TP] live scan empty (streaming?) — using remembered supply:",
+                bname, string.format("%.0fm", bestD or 0))
+        end
+    end
     if best then return best, bestPos, bestD end
     return nil
 end
@@ -749,7 +781,11 @@ end
 local function teleportToClosestBlades()
     local supply, pos, dist = findClosestSupply()
     if not supply then return false, "no blade supply in this map", nil, nil end
-    if Debug then Debug:Log("[TP] supply found:", supply:GetFullName(), string.format("%.0fm", dist or 0)) end
+    if Debug then
+        Debug:Log("[TP] supply found:",
+            (typeof(supply) == "Instance") and supply:GetFullName() or ("remembered: " .. tostring(supply.Name)),
+            string.format("%.0fm", dist or 0))
+    end
     local ok, err = teleportTo(pos)
     local rem = ReplicatedStorage:FindFirstChild("Assets")
     rem = rem and rem:FindFirstChild("Remotes")
@@ -3319,7 +3355,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.26 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.27 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.26 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.27 loaded", Duration = 3 })
 end)
