@@ -6,6 +6,16 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.21: THE SELF, FOUND BY EVIDENCE. v3.20's log proves the hitbox stays on,
+--// the lane moves 1100+ studs/5s, the trigger fires (132 swings) and blades are
+--// clean — and still zero damage, because every module entry throws: require(host)
+--// has .Loadout and .Cache but its Effects/Modules/Weapon are nil. The game's
+--// REAL controller state is a different object, and v3.21 finds it two ways:
+--// (1) a getgc() scan for any live table carrying .Loadout+.Cache+.Modules at
+--// once (HostState has only the first two), (2) passive hooks on Input.Slash /
+--// ODMG.M1 that capture the exact first argument the game itself passes when a
+--// real click swings. A synthesized real mouse click is the last-resort swing.
+--// getgenv().HamasFindSelf() re-runs the scan and prints the self's fields.
 --// v3.20: three fixes, all three traceable to log lines or probe output.
 --//        (1) "dont see the hitbox": the log shows the expander switched ON at
 --//        3414.66 and OFF at 3414.74 — the UI's default callbacks (the same
@@ -1270,6 +1280,60 @@ end
 local InputModule, ODMGModule, BladesModule
 local HostState --// require(host): carries .Loadout/.Cache — the best self measured so far
 
+--// v3.21 — FIND THE REAL SELF. require(host) carries Loadout and Cache but its
+--// Effects/Modules/Weapon are nil (the swing errors name each one), so the
+--// complete controller state the game actually passes is a different object.
+--// Two evidence-based ways to get it, both automatic, no guessing:
+--//   (1) getgc scan — ANY live table that has .Loadout AND .Cache AND .Modules
+--//   (2) passive hooks on Input.Slash / ODMG.M1 — the first argument the game
+--//       itself passes on a real click IS the real self
+local function armSelfHooks()
+    if GameEnv.selfHooksFor == GameEnv.modHost then return end
+    GameEnv.selfHooksFor = GameEnv.modHost
+    local function hookEntry(tbl, key)
+        if type(tbl) ~= "table" or type(tbl[key]) ~= "function" then return end
+        local orig = tbl[key]
+        tbl[key] = function(self, ...)
+            if type(self) == "table" and not GameEnv.selfObj
+                and self ~= HostState
+                and self.Loadout ~= nil and self.Cache ~= nil and self.Modules ~= nil then
+                GameEnv.selfObj = self
+                GameEnv.selfReason = "hook:" .. key
+                if Debug then Debug:Log("[Self] REAL self captured from", key, "— swings switch to it now") end
+            end
+            return orig(self, ...)
+        end
+    end
+    hookEntry(InputModule, "Slash")
+    hookEntry(ODMGModule, "M1")
+end
+
+local function findRealSelf(reason)
+    if type(GameEnv.selfObj) == "table" then return GameEnv.selfObj end
+    if type(getgc) ~= "function" then return nil end
+    local ok, found = pcall(function()
+        local cands = {}
+        for _, v in ipairs(getgc(true)) do
+            if type(v) == "table" and v ~= HostState
+                and v.Loadout ~= nil and v.Cache ~= nil and v.Modules ~= nil then
+                cands[#cands + 1] = v
+                if #cands >= 5 then break end
+            end
+        end
+        return cands
+    end)
+    if ok and type(found) == "table" and #found > 0 then
+        GameEnv.selfCandidates = found
+        GameEnv.selfObj = found[1]
+        GameEnv.selfReason = "getgc:" .. tostring(reason)
+        if Debug then
+            Debug:Log("[Self] getgc scan found", #found, "candidate(s) with .Loadout+.Cache+.Modules — using #1",
+                found[2] and "(getgenv().HamasSwingTest() prints each one's fields)" or "")
+        end
+    end
+    return GameEnv.selfObj
+end
+
 --// Re-resolve whenever the host changes (a respawn rebuilds char.Actor.Client.Host,
 --// and the modules under it are a different copy). Latching them once at inject
 --// time would silently pin us to the ReplicatedStorage copy again.
@@ -1286,6 +1350,9 @@ local function refreshModules()
     HostState = nil
     if host then pcall(function() HostState = require(host) end) end
     if type(HostState) ~= "table" then HostState = nil end
+    --// v3.21: arm the capture hooks and scan for the complete state object
+    armSelfHooks()
+    findRealSelf("module refresh")
     if Debug and not GameEnv.reported then
         GameEnv.reported = true
         Debug:Log("[Swing] modules from:", GameEnv.src,
@@ -1350,20 +1417,35 @@ end
 --// state table now. They may still die one level deeper (nil Effects / Weapon) —
 --// the pcall swallows that, Input.Action remains as the last fallback, and the
 --// [Under] titan-HP line remains the only proof that counts.
-local Swing = { logAt = 0, winner = nil, held = false, heldShape = nil, saidIt = false }
---// real entries first (state self), proven no-op last as the safety net
-local SWING_ORDER = { "ODMG.M1", "Input.Slash", "Input.Action" }
+local Swing = { logAt = 0, winner = nil, held = false, heldShape = nil, saidIt = false, lastSelf = nil }
+--// real entries first (REAL self > state self), then a genuine synthesized
+--// click, then the proven no-op as the safety net
+local SWING_ORDER = { "ODMG.M1", "Input.Slash", "Real.M1", "Input.Action" }
 
 --// returns a function(pressed) for this entry, or nil when it is not available
 local function swingPair(shape, host)
     local M, O = InputModule, ODMGModule
     if not host then return nil end
-    --// self preference: the state table (has Loadout/Cache), else the host
-    local selfArg = (type(HostState) == "table") and HostState or host
+    --// self preference: the REAL state object (all fields present), then the
+    --// partial require(host) table, then the host instance
+    local selfArg = (type(GameEnv.selfObj) == "table" and GameEnv.selfObj)
+        or (type(HostState) == "table" and HostState)
+        or host
     if shape == "ODMG.M1" and type(O) == "table" and type(O.M1) == "function" then
         return function(p) return pcall(O.M1, selfArg, p) end
     elseif shape == "Input.Slash" and type(M) == "table" and type(M.Slash) == "function" then
         return function(p) return pcall(M.Slash, selfArg, p) end
+    elseif shape == "Real.M1" then
+        --// last resort before the no-op: a genuine click through the game's own
+        --// input path — the same event your mouse produces
+        return function(p)
+            local cam = workspace.CurrentCamera
+            local vp = (cam and cam.ViewportSize) or Vector2.new(800, 600)
+            pcall(function()
+                VIM:SendMouseButtonEvent(math.floor(vp.X / 2), math.floor(vp.Y / 2), 0, p and true or false, game, 0)
+            end)
+            return true
+        end
     elseif shape == "Input.Action" and type(M) == "table" and type(M.Action) == "function" then
         return function(p) return pcall(M.Action, host, "Slash", p) end
     end
@@ -1399,6 +1481,13 @@ local function swing()
     --// release the previous press first, so no shape can ever be left held
     if Swing.held then releaseSwing() end
 
+    --// a newly captured/found REAL self invalidates the latched winner: the real
+    --// entries get first shot again before any fallback
+    if GameEnv.selfObj and Swing.lastSelf ~= GameEnv.selfObj then
+        Swing.lastSelf = GameEnv.selfObj
+        Swing.winner = nil
+    end
+
     local order = {}
     if Swing.winner then order[#order + 1] = Swing.winner end
     for _, s in ipairs(SWING_ORDER) do
@@ -1413,9 +1502,12 @@ local function swing()
                     Swing.winner = shape
                     if Debug then
                         if shape == "Input.Action" then
-                            Debug:Log("[Swing] using Input.Action (harmless; real entries refused the state self)")
+                            Debug:Log("[Swing] using Input.Action (harmless no-op — real self still missing)")
+                        elseif shape == "Real.M1" then
+                            Debug:Log("[Swing] using REAL mouse clicks (module entries refused every known self)")
                         else
-                            Debug:Log("[Swing] using", shape, "(state self = require(host))")
+                            Debug:Log("[Swing] using", shape, "(self =",
+                                type(GameEnv.selfObj) == "table" and "REAL state object" or "require(host) state", ")")
                         end
                     end
                 end
@@ -2545,8 +2637,20 @@ getgenv().HamasSwingTest = function()
     else
         say("require(host) -> " .. type(requiredHost))
     end
+    --// v3.21: the getgc/hooked candidates, with their fields, in YOUR console
+    if type(GameEnv.selfObj) == "table" then
+        local ks = {}
+        for k, v in pairs(GameEnv.selfObj) do
+            if #ks < 40 then ks[#ks + 1] = tostring(k) .. "=" .. type(v) end
+        end
+        table.sort(ks)
+        say("getgc/hooked self (" .. tostring(GameEnv.selfReason or "?") .. ", " ..
+            tostring(GameEnv.selfCandidates and #GameEnv.selfCandidates or 1) .. " candidate(s)):",
+            table.concat(ks, " "))
+    end
 
     local selves = {
+        { "found-self",    GameEnv.selfObj },
         { "host",          host },
         { "require(host)", requiredHost },
         { "host.Modules",  host:FindFirstChild("Modules") },
@@ -2608,6 +2712,26 @@ getgenv().HamasSwingTest = function()
     say("done — CLEAN + a TITAN HP drop marks the real self")
     GameEnv.testRunning = false
     return table.concat(out, "\n")
+end
+
+--// quick self-hunt you can run from the console; prints what it found
+--//     getgenv().HamasFindSelf()
+getgenv().HamasFindSelf = function()
+    refreshModules()
+    local s = findRealSelf("manual")
+    if type(s) ~= "table" then
+        print("[HamasFindSelf] none found — hook a real swing: click your mouse once in-game, then run this again")
+        return nil
+    end
+    local ks = {}
+    for k, v in pairs(s) do
+        if #ks < 60 then ks[#ks + 1] = tostring(k) .. "=" .. type(v) end
+    end
+    table.sort(ks)
+    print("[HamasFindSelf] self via " .. tostring(GameEnv.selfReason) .. " | candidates: "
+        .. tostring(GameEnv.selfCandidates and #GameEnv.selfCandidates or 1))
+    print("[HamasFindSelf] fields: " .. table.concat(ks, " "))
+    return s
 end
 
 local function needReload()
@@ -2764,6 +2888,7 @@ local function setFarm(v)
         --// can measure or reach, size grown on demand in ensureNapeReach().
         Nape.sliderSize = Nape.sliderSize or Nape.Size
         napeForceOn("farm start")
+        findRealSelf("farm start")
         ensureKillFloor(true)
     else
         releaseSwing() -- never hand the game back a held button
@@ -2977,7 +3102,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.20 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.21 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.20 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.21 loaded", Duration = 3 })
 end)
