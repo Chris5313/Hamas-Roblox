@@ -6,6 +6,18 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.18: STOMP SAFETY — "im getting stomped now look at the titans stomp hitbox
+--//        i need to go lower i just died". v3.17 climbed you UP to meet the nape
+--//        whenever the nape could not reach your depth, parking you just under the
+--//        ground surface — exactly where a stomp reaches. Fixed direction: the
+--//        depth slider and the titan's OWN lowest hitbox are the authority and we
+--//        go LOWER, never higher; the nape grows to reach us instead. titanFloorY()
+--//        measures the lowest bottom edge of every part under the titan's Hitboxes
+--//        (excluding the Nape, which is our inflated box) so "deep enough" is
+--//        decided by the titan's geometry, not by a number I picked. Nape cap raised
+--//        from 200 to 1000 because the cap is what forced the climb. And being hurt
+--//        now parks you 60 studs DEEPER than the slider instead of back where the
+--//        damage came from, so you heal clear of the stomp range.
 --// v3.17: two bugs in v3.16, both mine, both caught by one log line.
 --//        (1) Modules came back nil ("modules from: none | Input.Action: false
 --//        | Input.Slash: false | ODMG.M1: false"). Cause: the path walk used
@@ -664,6 +676,8 @@ local Farm = {
     UseBoost = true,         -- if we are not actually going that fast, tap the
                              -- game's own ODM boost (Input.Action("Boost"))
     RetreatTime = 2,         -- seconds hiding under the map when hurt
+    RetreatExtra = 60,       -- extra studs DEEPER while hurt (get clear of the stomp)
+    StompClearance = 25,     -- stay this far below the titan's lowest hitbox
     ParkDepth = 60,          -- studs BELOW the ground surface we park (UI slider)
     UnderDwell = 7,          -- seconds running the blade lane under ONE titan
     Mode = "auto",           -- "auto" (default) = ALWAYS under the map: we hold the
@@ -1017,7 +1031,7 @@ local function groundYAt(x, z)
 end
 
 --// "put me under the map by N studs" — N studs below the ground under you
-local function parkY(x, z)
+local function parkY(x, z, extra)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not x and hrp then x = hrp.Position.X end
@@ -1038,7 +1052,9 @@ local function parkY(x, z)
         end
     end
     local limit = voidLimit()
-    local want = surface - Farm.ParkDepth
+    --// extra = go DEEPER than the slider (used when we are hurt, to get clear of a
+    --// titan's stomp range instead of sitting inside it)
+    local want = surface - (Farm.ParkDepth + (extra or 0))
     Park.clamped = want < limit
     return math.max(want, limit)
 end
@@ -1048,12 +1064,12 @@ end
 --// it (holdUntil = "do not swing on top of a reload in progress").
 local AutoReload = { Enabled = true, cooldown = 0, lastLog = 0, tries = 0, holdUntil = 0, quietUntil = 0 }
 
-local function parkUnderPoint(x, z, reason)
+local function parkUnderPoint(x, z, reason, extra)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
     Park.x, Park.z = x, z
-    Park.y = parkY(x, z)
+    Park.y = parkY(x, z, extra)
     Park.on = true
     parkTick() -- put us there now; the connections keep us there
     if Debug then
@@ -1604,7 +1620,11 @@ local function napeContact(char)
         end
     end
     --// (2) the same question asked the other way round, in case this build's
-    --// Main/Copy have CanTouch off (the capture shows exactly that)
+    --// Main/Copy have CanTouch off (the capture shows exactly that). This is a
+    --// workspace-wide query and the nape can now be very large, so it is
+    --// rate-limited rather than run on every frame.
+    if os.clock() < (Trigger.geomAt or 0) then return nil end
+    Trigger.geomAt = os.clock() + 0.15
     local ok2, inside = pcall(function() return workspace:GetPartsInPart(nap) end)
     if ok2 and inside then
         for _, p in ipairs(inside) do
@@ -1706,10 +1726,35 @@ end)
 --//      own maximum), and only then
 --//   3. come up just enough to touch — never above the ground surface.
 -- ===========================================================================
-local NAPE_MAX_SIZE = 200
+--// v3.18: the cap was 200, and that is what forced you UP. If the nape cannot
+--// reach your depth at 200, the old code climbed to meet the nape — parking you
+--// just under the ground, inside a titan's stomp. A bigger box is the safe
+--// direction, so the cap is far higher and we grow the nape instead of rising.
+local NAPE_MAX_SIZE = 1000
 
 local function napeReachY(nape)
     return nape.Position.Y - (nape.Size.Y * 0.5)
+end
+
+--// THE STOMP FLOOR — how low a titan can actually hurt you, MEASURED.
+--// Every damaging volume a titan has lives under its Hitboxes folder (the probe
+--// listed Nape, Punch, Mouth, Eyes, LeftArm, LeftHand, LeftFoot, RightFoot, LeftLeg,
+--// ThirdHand, Collision, Head, UpperTorso). Take the LOWEST bottom edge of those and
+--// EXCLUDE the Nape — that one is OUR inflated box and would give a meaningless
+--// answer. Park below this line and a stomp cannot reach you. No guessing: the
+--// titan's own geometry decides how deep "deep enough" is.
+local function titanFloorY(titan, nape)
+    if not titan then return nil end
+    local hb = titan:FindFirstChild("Hitboxes")
+    if not hb then return nil end
+    local lowest
+    for _, d in ipairs(hb:GetDescendants()) do
+        if d:IsA("BasePart") and d ~= nape and d.Name ~= "Nape" then
+            local bottom = d.Position.Y - d.Size.Y * 0.5
+            if not lowest or bottom < lowest then lowest = bottom end
+        end
+    end
+    return lowest
 end
 
 --// grow the expander until its bottom reaches wantY. returns the size in use.
@@ -1755,7 +1800,6 @@ local function underAttack(titan, seconds)
 
     --// the lane runs straight under the nape, at the depth you asked for
     local x, z = np.Position.X, np.Position.Z
-    local surface = groundYAt(x, z)
     local want = parkY(x, z) -- below the surface, clamped above the void limit
 
     --// CFrame drifts the lane, so the park must let go, and PlatformStand stops
@@ -1789,16 +1833,22 @@ local function underAttack(titan, seconds)
         local cur = napeOf(titan)
         if not (cur and cur.Parent and hum.Health > 0) then break end
 
-        --// the titan walks: keep the lane under it, and keep the nape big enough
-        --// to reach our depth
-        local y = want
-        local sizeNow = ensureNapeReach(cur, want)
-        local reach = napeReachY(cur)
-        if reach > y + bladeTop then
-            --// even a maxed nape cannot reach that deep -> rise just enough to
-            --// touch, but never break the ground surface
-            y = math.max(math.min(reach - bladeTop - 1, surface - 6), voidLimit())
+        --// v3.18 — NEVER RISE INTO THE STOMP. v3.17 climbed you up to meet the nape
+        --// whenever the nape could not reach your depth. That parked you just under
+        --// the ground surface, which is exactly where a titan's stomp hitbox
+        --// reaches — and you died there. The depth slider and the titan's own stomp
+        --// floor are the authority now: we go LOWER, never higher. The nape grows to
+        --// reach us instead of us climbing up to it.
+        local floorY = titanFloorY(titan, cur)
+        local safeY = want
+        if floorY then
+            --// below the lowest thing this titan can hit you with, plus clearance
+            safeY = math.min(want, floorY - Farm.StompClearance)
         end
+        safeY = math.max(safeY, voidLimit())
+        local y = safeY
+        local sizeNow = ensureNapeReach(cur, y)
+        local reach = napeReachY(cur)
         Sweep.center = Vector3.new(cur.Position.X, y, cur.Position.Z)
 
         --// report the real numbers: lane depth, whether the nape reaches it, and
@@ -1811,7 +1861,10 @@ local function underAttack(titan, seconds)
                 local titanModel = cur:FindFirstAncestorOfClass("Model")
                 local tHum = titanModel and titanModel:FindFirstChildOfClass("Humanoid")
                 local segNow, segMax = bladeSegments()
-                Debug:Log("[Under] lane Y", math.floor(y), "| nape bottom Y", math.floor(reach),
+                Debug:Log("[Under] lane Y", math.floor(y),
+                    "| stomp floor Y", floorY and math.floor(floorY) or "?",
+                    "| nape bottom Y", math.floor(reach),
+                    (reach > y + bladeTop) and "| SHORT: raise Nape Size" or "| nape reaches you",
                     "| nape size", sizeNow, "| blade speed", math.floor(Sweep.speed or 0),
                     "| titan HP", tHum and math.floor(tHum.Health) or "?",
                     "| segments", segNow .. "/" .. segMax)
@@ -1902,7 +1955,7 @@ local function passTitan(titan, seconds)
 end
 
 --// under the map, out of reach of everything
-local function parkIdle(reason)
+local function parkIdle(reason, extra)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
@@ -1910,7 +1963,7 @@ local function parkIdle(reason)
     local np = t and napeOf(t)
     local x, z = hrp.Position.X, hrp.Position.Z
     if np then x, z = np.Position.X, np.Position.Z end
-    parkUnderPoint(x, z, reason)
+    parkUnderPoint(x, z, reason, extra)
 end
 
 local function killSweep()
@@ -1962,7 +2015,8 @@ local function killSweep()
         --// hurt -> dive under the map until the grab is off you
         if hum.Health <= Farm.RetreatHP then
             Farm.state = "HIDING"
-            parkIdle("hurt")
+            --// hurt: go DEEPER than the slider, not back to the same spot that hurt
+            parkIdle("hurt", Farm.RetreatExtra)
             local untilT = os.clock() + Farm.RetreatTime
             while os.clock() < untilT and Attack.active and Farm.Enabled do task.wait(0.1) end
             Farm.state = "KILLING"
@@ -2736,7 +2790,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.17 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.18 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.17 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.18 loaded", Duration = 3 })
 end)
