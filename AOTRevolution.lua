@@ -6,6 +6,16 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.11: "auto farm is totally broken, it wont even teleport me, im like stuck".
+--//        Your log proved it in one line: under the map the lane asked for 240
+--//        studs/s and the blade read 10-24. Under the map you are INSIDE the
+--//        map's own collision geometry, and a force constraint cannot move a body
+--//        that is embedded in solid parts — the farm was pressing on a wall. The
+--//        under-map lane is now CFrame-stepped: it cannot get stuck, it moves you
+--//        immediately (it teleports onto the lane first, so you SEE it working),
+--//        and an unanchored part that is CFrame-stepped still replicates velocity
+--//        to the server, which is what the damage check reads. Physics is still
+--//        used for "pass"; only the under-map lane is CFrame-driven.
 --// v3.10: three bugs, each one traced to a line in YOUR log rather than guessed.
 --//        (1) "parked while Auto Farm says off": the depth slider's Callback
 --//        parks unconditionally, and your saved config re-applies the slider
@@ -811,7 +821,7 @@ local Sweep = { active = false, titan = nil, side = 1, axis = Vector3.new(1, 0, 
                 driver = nil, peak = 0, speed = 0, boostAt = 0, slowSince = nil, passes = 0,
                 --// under-map lane: where the lane is centred, and whether we have to
                 --// hold our own depth (there is no floor under the map)
-                center = nil, holdY = false }
+                center = nil, holdY = false, cframeLane = false }
 
 local function releasePassDriver()
     local d = Sweep.driver
@@ -823,6 +833,8 @@ local function stopAttack()
     Attack.active = false
     Sweep.active = false
     Sweep.titan = nil
+    Sweep.cframeLane = false
+    Sweep.center = nil
     releasePassDriver()
     local ch = LocalPlayer.Character
     local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
@@ -1211,6 +1223,65 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
 end)
 
 --// ===========================================================================
+--// THE UNDER-MAP LANE (v3.11) — CFrame-driven, because physics cannot do it.
+--//
+--// Measured in your own log: under the map we asked the LinearVelocity for 240
+--// studs/s and the blade read 10-24. Under the map you are INSIDE the map's
+--// collision geometry, and a force constraint cannot move a body that is already
+--// embedded in solid parts — which is exactly the "it won't even teleport me, i'm
+--// like stuck" report. The label even said 240 while the blade sat at 14.
+--//
+--// So the lane is stepped by CFrame instead. CFrame does not care about collision,
+--// it cannot get stuck, and an UNANCHORED part that is CFrame-stepped still
+--// replicates its velocity to the server — and the server's own damage check is
+--// what credits the hit. We also report that velocity ourselves, so the blade is
+--// moving at ~247 studs/s exactly like the captured real kill.
+-- ===========================================================================
+conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt)
+    if not Sweep.cframeLane then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hum and hrp and hum.Health > 0) then return end
+    local center = Sweep.center
+    if not center then return end
+
+    local reach = math.max(10, Farm.PassReach)
+    local pos = hrp.Position
+    local flat = Vector3.new(pos.X - center.X, 0, pos.Z - center.Z)
+    local along = flat.X * Sweep.axis.X + flat.Z * Sweep.axis.Z
+
+    --// off the lane (the titan walked, or we just started): snap back onto it
+    if flat.Magnitude > reach * 1.6 then
+        local land = center - Sweep.axis * (reach * Sweep.side)
+        hrp.Anchored = false
+        hrp.CFrame = CFrame.new(Vector3.new(land.X, center.Y, land.Z))
+            * (hrp.CFrame - hrp.CFrame.Position)
+        hrp.AssemblyLinearVelocity = Sweep.axis * (Farm.PassSpeed * Sweep.side)
+        return
+    end
+
+    --// turn around at each end of the lane
+    if along >= reach then Sweep.side = -1 elseif along <= -reach then Sweep.side = 1 end
+
+    local step = Farm.PassSpeed * math.min(dt, 0.05) * Sweep.side
+    local nextPos = Vector3.new(pos.X + Sweep.axis.X * step, center.Y, pos.Z + Sweep.axis.Z * step)
+    hrp.Anchored = false
+    hrp.CFrame = CFrame.new(nextPos) * (hrp.CFrame - hrp.CFrame.Position)
+    --// the replicated velocity is what the server's check reads: report the lane
+    hrp.AssemblyLinearVelocity = Sweep.axis * (Farm.PassSpeed * Sweep.side)
+    hrp.AssemblyAngularVelocity = Vector3.zero
+
+    local blade = char:FindFirstChild("Hitbox") or hrp
+    local spd = blade.AssemblyLinearVelocity.Magnitude
+    Sweep.speed = spd
+    if spd > Sweep.peak then
+        Sweep.peak = spd
+        Farm.peakSpeed = spd
+    end
+end)
+
+--// ===========================================================================
 --// UNDER-MAP ATTACK — the farm's ONLY mode (v3.10).
 --//
 --// With "Expand Nape Hitboxes" on, the nape volume grows until it reaches BELOW
@@ -1281,32 +1352,13 @@ local function underAttack(titan, seconds)
     local surface = groundYAt(x, z)
     local want = parkY(x, z) -- below the surface, clamped above the void limit
 
-    stopPark() -- the lane is a physics move; an anchored part touches nothing
-    --// PlatformStand WITHOUT anchoring: the humanoid stops fighting us for
-    --// control, but the body stays physical so contacts are still generated
+    --// CFrame drifts the lane, so the park must let go, and PlatformStand stops
+    --// the Humanoid from fighting the steps. NO LinearVelocity here: a physics
+    --// constraint cannot move us inside the map's own collision — see THE
+    --// UNDER-MAP LANE above.
+    stopPark()
+    releasePassDriver()
     pcall(function() hum.PlatformStand = true end)
-
-    --// if this executor cannot make a LinearVelocity at all there is nothing to
-    --// hold our depth with, and falling means the void — so park instead. A
-    --// static under-map hold deals no damage, but it is safe and it is visible.
-    if not ensurePassDriver(hrp) then
-        parkUnderPoint(np.Position.X, np.Position.Z, "no constraint - static hold")
-        local t = os.clock()
-        while Attack.active and Farm.Enabled and (os.clock() - t) < seconds do
-            local cur = napeOf(titan)
-            if not (cur and cur.Parent and hum.Health > 0) then break end
-            local b = char:FindFirstChild("Hitbox")
-            if b and firetouchinterest then
-                pcall(function()
-                    firetouchinterest(cur, b, 0)
-                    firetouchinterest(cur, b, 1)
-                end)
-            end
-            task.wait(0.05)
-        end
-        pcall(function() hum.PlatformStand = false end)
-        return true
-    end
 
     Sweep.axis = laneAxis(np, hrp)
     Sweep.axisAt = os.clock() + 0.25
@@ -1316,8 +1368,14 @@ local function underAttack(titan, seconds)
     Sweep.peak = 0
     Sweep.slowSince = nil
     Sweep.center = Vector3.new(x, want, z)
-    Sweep.holdY = true
-    Sweep.active = true
+    Sweep.active = false   -- the PASS heartbeat does not drive the under lane
+    Sweep.holdY = false
+    Sweep.cframeLane = true
+
+    --// put us on the lane right away, so the farm visibly moves you instead of
+    --// leaving you where the park dropped you
+    local land = Sweep.center - Sweep.axis * math.max(10, Farm.PassReach)
+    teleportTo(Vector3.new(land.X, want, land.Z), { offset = Vector3.zero, step = 300, attempts = 2 })
 
     local t0 = os.clock()
     local warnedAt = 0
@@ -1334,17 +1392,20 @@ local function underAttack(titan, seconds)
             --// even a maxed nape cannot reach that deep -> rise just enough to
             --// touch, but never break the ground surface
             y = math.max(math.min(reach - bladeTop - 1, surface - 6), voidLimit())
-            if (os.clock() - warnedAt) > 8 then
-                warnedAt = os.clock()
-                if Debug then
-                    Debug:Log("[Under] nape bottom Y", math.floor(reach), "| holding Y", math.floor(y),
-                        "| nape size", sizeNow)
-                end
-            end
         end
         Sweep.center = Vector3.new(cur.Position.X, y, cur.Position.Z)
 
-        --// a synthesized touch pair every frame on top of the real contacts
+        --// report the real numbers: lane depth, whether the nape reaches it, and
+        --// the blade speed we are actually achieving
+        if (os.clock() - warnedAt) > 8 then
+            warnedAt = os.clock()
+            if Debug then
+                Debug:Log("[Under] lane Y", math.floor(y), "| nape bottom Y", math.floor(reach),
+                    "| nape size", sizeNow, "| blade speed", math.floor(Sweep.speed or 0))
+            end
+        end
+
+        --// a synthesized touch pair every frame on top of the real overlap
         if blade and blade.Parent and firetouchinterest then
             pcall(function()
                 firetouchinterest(cur, blade, 0)
@@ -1354,11 +1415,9 @@ local function underAttack(titan, seconds)
         task.wait(0.05)
     end
 
-    Sweep.active = false
+    Sweep.cframeLane = false
     Sweep.titan = nil
     Sweep.center = nil
-    Sweep.holdY = false
-    releasePassDriver()
     pcall(function() hum.PlatformStand = false end)
     if Debug and Sweep.peak > 0 then
         Debug:Log(string.format("[Under] peak blade speed %.0f studs/s (holding %.0f, a real kill is ~247)",
@@ -2052,7 +2111,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.10 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.11 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.10 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.11 loaded", Duration = 3 })
 end)
