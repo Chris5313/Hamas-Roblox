@@ -6,6 +6,19 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.19: STOP BREAKING THINGS. Two of my own changes were making it worse, not
+--//        better. (1) Auto-growing the nape silently overrode the size you chose and
+--//        built 236+ stud boxes — a part that size can drop your framerate hard
+--//        enough to look exactly like a frozen farm. The expander is YOUR control
+--//        again: it is never resized, only measured and reported. (2) swing() was
+--//        firing ODMG.M1 / Input.Slash every frame even though their own errors
+--//        prove they throw (Loadout / Cache / Modules.S_Achievements are missing on
+--//        the Host), then latching Input.Action — the proven no-op. Until the real
+--//        self is identified it sends only the harmless entry. getgenv().HamasSwingTest()
+--//        now hunts that self directly: it tries every plausible first argument
+--//        against each entry and the error text names the winner. The lane also
+--//        logs how far it moved ([Lane]), so "not moving" is measurable rather
+--//        than a matter of opinion.
 --// v3.18: STOMP SAFETY — "im getting stomped now look at the titans stomp hitbox
 --//        i need to go lower i just died". v3.17 climbed you UP to meet the nape
 --//        whenever the nape could not reach your depth, parking you just under the
@@ -1278,8 +1291,15 @@ end
 --// a press WITHOUT a release leaves the gear holding the button — and while it is
 --// held it will not accept another swing, not from us and not from YOU either. So
 --// the release is not optional bookkeeping, it is why manual swinging kept working.
-local Swing = { logAt = 0, winner = nil, held = false, heldShape = nil }
-local SWING_ORDER = { "ODMG.M1", "Input.Slash", "Input.Action" }
+--// v3.19: we do NOT know the correct first argument yet. The errors name what it
+--// must carry — Loadout (for Input.Slash / ODMG.M1), Cache (ODMG.Reload) and
+--// Modules.S_Achievements (Blades.Reload) — and the Host instance has none of
+--// them, so ODMG.M1(h) and Input.Slash(h) throw on EVERY swing. Firing entries
+--// that are known to throw every frame is noise, not progress. Until
+--// getgenv().HamasSwingTest() identifies the real self, we send only the one entry
+--// that is harmless (Input.Action), and we say so once.
+local Swing = { logAt = 0, winner = nil, held = false, heldShape = nil, saidIt = false }
+local SWING_ORDER = { "Input.Action" }
 
 --// returns a function(pressed) for this entry, or nil when it is not available
 local function swingPair(shape, host)
@@ -1336,10 +1356,14 @@ local function swing()
             if ok then
                 if Swing.winner ~= shape then
                     Swing.winner = shape
-                    if Debug then Debug:Log("[Swing] using", shape, "(host-first)") end
+                    if Debug then Debug:Log("[Swing] using", shape, "(harmless; self still unidentified)") end
                 end
                 Swing.held = true
                 Swing.heldShape = shape
+                if not Swing.saidIt and Debug then
+                    Swing.saidIt = true
+                    Debug:Log("[Swing] no proven swing entry yet — run getgenv().HamasSwingTest() to find the self")
+                end
                 return true
             elseif Debug and (os.clock() - Swing.logAt) > 5 then
                 Swing.logAt = os.clock()
@@ -1528,6 +1552,17 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt)
     if spd > Sweep.peak then
         Sweep.peak = spd
         Farm.peakSpeed = spd
+    end
+
+    --// MOVEMENT PROOF. "im not moving back and forth" has to be measurable, not a
+    --// matter of opinion: this reports how far the lane actually carried you. If it
+    --// reads ~0 the lane is not running, whatever the blade speed claims.
+    Sweep.travel = (Sweep.travel or 0) + math.abs(step)
+    if Debug and (os.clock() - (Sweep.travelAt or 0)) > 5 then
+        Sweep.travelAt = os.clock()
+        Debug:Log(string.format("[Lane] moved %.0f studs in 5s | Y %.0f | blade speed %.0f",
+            Sweep.travel, hrp.Position.Y, Sweep.speed or 0))
+        Sweep.travel = 0
     end
 end)
 
@@ -1730,7 +1765,7 @@ end)
 --// reach your depth at 200, the old code climbed to meet the nape — parking you
 --// just under the ground, inside a titan's stomp. A bigger box is the safe
 --// direction, so the cap is far higher and we grow the nape instead of rising.
-local NAPE_MAX_SIZE = 1000
+local NAPE_MAX_SIZE = 400
 
 local function napeReachY(nape)
     return nape.Position.Y - (nape.Size.Y * 0.5)
@@ -1757,22 +1792,27 @@ local function titanFloorY(titan, nape)
     return lowest
 end
 
---// grow the expander until its bottom reaches wantY. returns the size in use.
+--// v3.19: this used to RESIZE the nape for you, and that was a mistake twice over.
+--// It overrode the size you chose in the Combat tab, and it silently built boxes
+--// of 236+ studs — a part that size can drop your framerate hard enough to look
+--// like the farm has frozen ("im not moving"). The expander is YOUR control. So
+--// this no longer changes anything: it measures what size would be needed, tells
+--// you once every 15s, and leaves the decision (and the slider) to you.
 local napeGrowAt = 0
 local function ensureNapeReach(nape, wantY)
     local need = math.ceil((nape.Position.Y - wantY) * 2 + 12)
     if need <= (Nape.Size or 0) then return Nape.Size end
-    local before = Nape.Size
-    Nape.Size = math.min(NAPE_MAX_SIZE, need)
-    if Nape.Enabled then napeRefreshAll() end
-    --// say it out loud (rate-limited) rather than silently changing your slider
-    if os.clock() - napeGrowAt > 10 then
+    if os.clock() - napeGrowAt > 15 then
         napeGrowAt = os.clock()
-        if Debug then Debug:Log("[Under] Nape Size", before, "->", Nape.Size, "to reach Y", math.floor(wantY)) end
+        if Debug then
+            Debug:Log("[Under] nape needs size ~" .. math.min(need, NAPE_MAX_SIZE) .. " to reach Y " ..
+                math.floor(wantY) .. " (your slider is " .. math.floor(Nape.Size or 0) .. " — not changing it)")
+        end
         pcall(function()
             Fluent:Notify({ Title = "HamasClient",
-                Content = ("Nape Size raised to %d so the nape reaches under the map"):format(Nape.Size),
-                Duration = 4 })
+                Content = ("Nape Size ~%d would reach your depth — raise the slider in Combat if you want it")
+                    :format(math.min(need, NAPE_MAX_SIZE)),
+                Duration = 5 })
         end)
     end
     return Nape.Size
@@ -2374,60 +2414,76 @@ getgenv().HamasBladeProbe = function()
     return line
 end
 
---// HOST-AWARE SWING TEST — the one that should name the working entry.
+--// SELF FINDER — hunting the FIRST ARGUMENT these gear functions actually want.
+--// We know from their own errors what that object has to carry:
+--//     Input.Slash / ODMG.M1 -> arg1.Loadout
+--//     ODMG.Reload           -> arg1.Cache
+--//     Blades.Reload         -> arg1.Modules.S_Achievements
+--// The Host instance carries none of those, which is why every attempt so far threw.
+--// So try every plausible self against each entry and read the ERROR TEXT: the
+--// combination that stops complaining is the one. Input.Action is excluded as a
+--// winner — it is the no-op we already proved.
 --//     getgenv().HamasSwingTest()
---// Every candidate is called with the HOST as argument one, which is what the
---// probe's error messages said these functions want. For each it reports whether it
---// threw, and whether the target titan's HP changed in the next half second. The
---// entry that drops HP is the real swing; everything else is a no-op and gets
---// dropped from the script. Run it parked under a titan's nape with Auto Farm on.
 getgenv().HamasSwingTest = function()
+    refreshModules()
+    if GameEnv.testRunning then return "already running" end
     local host = gameHost()
-    if not host then return "no host (char.Actor.Client.Host.Actor/.Client/.Host)" end
-    local out = { "host=" .. host:GetFullName(), "modules=", GameEnv.src }
+    if not host then return "no host (char.Actor.Client.Host)" end
+    GameEnv.testRunning = true
+    local out = {}
+
+    local requiredHost
+    pcall(function() requiredHost = require(host) end)
+
+    local selves = {
+        { "host",          host },
+        { "require(host)", requiredHost },
+        { "host.Modules",  host:FindFirstChild("Modules") },
+        { "ODMG",          ODMGModule },
+        { "Input",         InputModule },
+        { "Blades",        BladesModule },
+        { "Player",        LocalPlayer },
+        { "Character",     LocalPlayer.Character },
+    }
+
     local function titanHP()
         local cur = Sweep.titan and napeOf(Sweep.titan)
         local t = cur and cur:FindFirstAncestorOfClass("Model")
         local h = t and t:FindFirstChildOfClass("Humanoid")
         return h and h.Health or nil
     end
-    refreshModules()
-    local O, M, B = ODMGModule, InputModule, BladesModule
-    --// every swing candidate below carries a THIRD entry: the release. The test
-    --// always releases after each one, so it can never leave the gear holding the
-    --// button (which would block your own swings as well as ours).
-    local cands = {
-        { "ODMG.M1(host,true/false)",  function() return O and O.M1(host, true) end,
-          function() return O and O.M1(host, false) end },
-        { "Input.Slash(host,p)",       function() return M and M.Slash(host, true) end,
-          function() return M and M.Slash(host, false) end },
-        { "Input.Action(host,'Slash',p)", function() return M and M.Action(host, "Slash", true) end,
-          function() return M and M.Action(host, "Slash", false) end },
-        { "Input.Action(host,p)",      function() return M and M.Action(host, true) end,
-          function() return M and M.Action(host, false) end },
-        { "Blades.Reload(host)",       function() return B and B.Reload(host) end },
-        { "ODMG.Reload(host)",         function() return O and O.Reload(host) end },
-        { "ODMG.Get_Reload(host)",     function() return O and O.Get_Reload(host) end },
+
+    local entries = {
+        { "ODMG.M1",         function(s) return ODMGModule and ODMGModule.M1(s, true) end,
+                             function(s) return ODMGModule and ODMGModule.M1(s, false) end },
+        { "Input.Slash",     function(s) return InputModule and InputModule.Slash(s, true) end,
+                             function(s) return InputModule and InputModule.Slash(s, false) end },
+        { "Blades.Reload",   function(s) return BladesModule and BladesModule.Reload(s) end },
+        { "ODMG.Reload",     function(s) return ODMGModule and ODMGModule.Reload(s) end },
+        { "ODMG.Get_Reload", function(s) return ODMGModule and ODMGModule.Get_Reload(s) end },
     }
-    for _, c in ipairs(cands) do
-        local h0 = titanHP()
-        local seg0 = select(1, bladeSegments())
-        local ok, err = pcall(c[2])
-        task.wait(0.5)
-        local h1 = titanHP()
-        local seg1 = select(1, bladeSegments())
-        if c[3] then pcall(c[3]) end --// always release, whatever happened
-        local line = ("%s -> %s"):format(c[1], ok and "clean" or ("ERR " .. tostring(err)))
-        if h0 and h1 and h0 ~= h1 then line = line .. ("   *** TITAN HP %d -> %d"):format(h0, h1) end
-        if seg1 ~= seg0 then line = line .. ("   blades %d -> %d"):format(seg0, seg1) end
-        out[#out + 1] = line
-        if Debug then Debug:Log("[SwingTest]", line) end
-        task.wait(0.25)
+
+    if Debug then Debug:Log("[SelfTest] host:", host:GetFullName(), "| modules from:", GameEnv.src) end
+    for _, e in ipairs(entries) do
+        for _, s in ipairs(selves) do
+            if s[2] ~= nil then
+                local h0 = titanHP()
+                local ok, err = pcall(e[2], s[2])
+                if e[3] then pcall(e[3], s[2]) end --// always release
+                task.wait(0.3)
+                local h1 = titanHP()
+                local line = ("%s(%s) -> %s"):format(e[1], s[1], ok and "CLEAN" or tostring(err))
+                if ok and h0 and h1 and h0 ~= h1 then
+                    line = line .. (("   *** TITAN HP %d -> %d  <- THIS IS IT"):format(h0, h1))
+                end
+                out[#out + 1] = line
+                if Debug then Debug:Log("[SelfTest]", line) end
+            end
+        end
     end
-    local seg, segMax = bladeSegments()
-    out[#out + 1] = ("segments %d/%d | swing winner so far: %s"):format(seg, segMax, tostring(Swing.winner))
-    if Debug then Debug:Log("[SwingTest]", out[#out + 1]) end
-    return table.concat(out, " || ")
+    if Debug then Debug:Log("[SelfTest] done — the CLEAN one is the right self") end
+    GameEnv.testRunning = false
+    return table.concat(out, "\n")
 end
 
 local function needReload()
@@ -2790,7 +2846,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.18 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.19 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.18 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.19 loaded", Duration = 3 })
 end)
