@@ -6,6 +6,19 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.9: three real bugs, all found by reading the code rather than guessing.
+--//        (1) The park dragged you UP because the "ground" was a plain raycast:
+--//        the first thing hit going down could be a titan, another player, or
+--//        your own expanded nape box (size 200 reaches ~100 studs above the
+--//        neck), so the surface was in mid-air and surface-minus-depth put you
+--//        above the map. Only anchored world geometry counts as ground now.
+--//        (2) Everything that moves you can now release the park first — the
+--//        blade teleport lands and then got dragged straight back, which is why
+--//        it looked broken. (3) UNDER-MAP ATTACK mode: with the nape expander on
+--//        the farm no longer flies you out at all, it holds the depth slider's
+--//        position under the nape and swings, and tells you the Nape Size needed
+--//        when the expanded nape cannot reach you. Loader and header now
+--//        cache-bust every raw fetch, so a pushed fix actually arrives.
 --// v3.8: the farm no longer flashes on/off when you inject. Cause: the config
 --//        autoload (~2s after inject) re-applied a saved "AOT_FarmMaster: false",
 --//        so the resume switched the farm on and the config switched it straight
@@ -57,15 +70,23 @@
 --//        and a distance-proof blade teleport.
 
 
---// loadstring entry (works from Synapse workspace AND raw GitHub):
---// loadstring(game:HttpGet("https://raw.githubusercontent.com/Chris5313/Hamas-Roblox/main/AOTRevolution.lua", true))()
+--// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
+--// can hand you an old build no matter what we push):
+--//   loadstring(game:HttpGet("https://raw.githubusercontent.com/Chris5313/Hamas-Roblox/main/AOTRevolution.lua?v=" .. tostring(os.time()), true))()
+--// ...or straight off disk:  loadstring(readfile("HamasAOTRevolution.lua"))()
+local RAW_BASE = "https://raw.githubusercontent.com/Chris5313/Hamas-Roblox/main/"
+local function rawFetch(name)
+    local url = RAW_BASE .. name .. "?v=" .. tostring(os.time()) .. tostring(math.random(1000, 9999))
+    return game:HttpGet(url, true)
+end
+
 local Base
 if getgenv().HamasLoad then
     Base = getgenv().HamasLoad("HamasBase.lua")
 else
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/Chris5313/Hamas-Roblox/main/loader.lua", true))()
+    loadstring(rawFetch("loader.lua"))()
     Base = getgenv().HamasLoad and getgenv().HamasLoad("HamasBase.lua")
-        or loadstring(game:HttpGet("https://raw.githubusercontent.com/Chris5313/Hamas-Roblox/main/HamasBase.lua", true))()
+        or loadstring(rawFetch("HamasBase.lua"))()
 end
 
 --// kill any previous run's loops/watchers before reloading
@@ -73,7 +94,7 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "3.8",
+    Version = "3.9",
     Debug = true,
     Tabs = {
         { Title = "Farming",  Icon = "wheat" },
@@ -108,6 +129,64 @@ local function typing()
     end)
     return ok and box ~= nil
 end
+
+--// ===========================================================================
+--// THE PARK — you, under the map, enforced every frame.
+--//
+--// This lives up here because EVERYTHING that moves you (the blade teleport, the
+--// pass lane, a hop) has to be able to switch it off first. It used to be
+--// defined below the teleport code, so `teleportTo` could not release it — and
+--// since the park re-asserts the position on four separate steps per frame, the
+--// teleport got dragged straight back. That is why "Teleport to closest blades"
+--// looked broken: it landed, then the park pulled you home.
+-- ===========================================================================
+local Park = { on = false, x = 0, y = 0, z = 0, lastLog = 0, actual = 0, clamped = false, warnedAt = 0 }
+
+local function parkTick()
+    if not Park.on then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    --// never fight a respawn: while you are dead the engine is moving you, and
+    --// yanking the root back down mid-respawn is how you end up stuck falling
+    if not (hrp and hum and hum.Health > 0) then return end
+    --// PlatformStand stops the humanoid pushing you back to your feet, which is
+    --// one of the ways the gear's movement fights the park
+    if not hum.PlatformStand then pcall(function() hum.PlatformStand = true end) end
+    hrp.Anchored = true
+    hrp.CFrame = CFrame.new(Park.x, Park.y, Park.z)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    Park.actual = hrp.Position.Y
+end
+
+--// asserted from every step we can get: before the physics step, after it, in the
+--// render step, and last of all in a binding that runs AFTER the camera update
+conns[#conns + 1] = RunService.Heartbeat:Connect(parkTick)
+pcall(function()
+    conns[#conns + 1] = RunService.PreSimulation:Connect(parkTick)
+end)
+pcall(function()
+    conns[#conns + 1] = RunService.RenderStepped:Connect(parkTick)
+end)
+pcall(function()
+    RunService:BindToRenderStep("HamasPark", Enum.RenderPriority.Camera.Value + 1, parkTick)
+end)
+
+local function stopPark()
+    if not Park.on then return end
+    Park.on = false
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hum then pcall(function() hum.PlatformStand = false end) end
+    if hrp then
+        hrp.Anchored = false
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+end
+
+getgenv().HamasAOT_StopPark = stopPark
 
 --// ===========================================================================
 --// ESP — Players (service-driven) + Titans (lobby-safe Collect)
@@ -356,6 +435,10 @@ local function teleportTo(target, opts)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not (hrp and target) then return false, "no character" end
+    --// release the park FIRST. It re-asserts your position four times a frame,
+    --// so without this the teleport lands and is then dragged straight back —
+    --// which is exactly the "Teleport to closest blades is broken" symptom.
+    stopPark()
     local goal = target + (opts.offset or Vector3.new(0, 3, 0))
     hrp.Anchored = false
     for _ = 1, (opts.attempts or 5) do
@@ -378,6 +461,20 @@ end
 
 --// closest blade supply (gas tank / cannister) — no distance limit at all, and
 --// the game's own position sync is told about it so its check agrees with us
+--// Blade / gas supply. The old matcher only knew "GasTank" and "Cannister", so a
+--// map that names its rack anything else reported "no blade supply" — it now
+--// accepts any Model/Part whose name mentions gas, blades, cannister, a rack or a
+--// supply, and it returns the NAME it found so we can see what the map calls it.
+local SUPPLY_WORDS = { "gastank", "gas", "cannister", "canister", "blade", "supply", "rack", "refill" }
+
+local function looksLikeSupply(name)
+    local n = name:lower()
+    for _, w in ipairs(SUPPLY_WORDS) do
+        if n:find(w, 1, true) then return true end
+    end
+    return false
+end
+
 local function findClosestSupply()
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -387,7 +484,7 @@ local function findClosestSupply()
         local pos
         if inst:IsA("Model") then
             local ok, cf = pcall(inst.GetPivot, inst)
-            if not ok then return end
+            if not ok or not cf then return end
             pos = cf.Position
         elseif inst:IsA("BasePart") then
             pos = inst.Position
@@ -399,14 +496,16 @@ local function findClosestSupply()
     end
     local function scan(root)
         if not root then return end
+        local T = workspace:FindFirstChild("Titans")
         for _, d in ipairs(root:GetDescendants()) do
-            local n = d.Name
-            if (n == "GasTank" or n:find("Cannister") or n:find("Canister")) and not d:IsDescendantOf(char) then
-                consider(d)
-            end
+            if not looksLikeSupply(d.Name) then continue end
+            if char and d:IsDescendantOf(char) then continue end
+            if T and d:IsDescendantOf(T) then continue end
+            if d:IsA("Model") or d:IsA("BasePart") then consider(d) end
         end
     end
-    scan(workspace:FindFirstChild("Unclimbable"))
+    local U = workspace:FindFirstChild("Unclimbable")
+    scan(U)
     if not best then scan(workspace) end
     if best then return best, bestPos, bestD end
     return nil
@@ -414,13 +513,14 @@ end
 
 local function teleportToClosestBlades()
     local supply, pos, dist = findClosestSupply()
-    if not supply then return false, "no blade supply in this map", nil end
+    if not supply then return false, "no blade supply in this map", nil, nil end
+    if Debug then Debug:Log("[TP] supply found:", supply:GetFullName(), string.format("%.0fm", dist or 0)) end
     local ok, err = teleportTo(pos)
     local rem = ReplicatedStorage:FindFirstChild("Assets")
     rem = rem and rem:FindFirstChild("Remotes")
     local POST = rem and rem:FindFirstChild("POST")
     if POST then pcall(function() POST:FireServer(pos) end) end
-    return ok, err, dist
+    return ok, err, dist, supply.Name
 end
 
 --// ===========================================================================
@@ -454,9 +554,9 @@ local Farm = {
                              -- game's own ODM boost (Input.Action("Boost"))
     RetreatTime = 2,         -- seconds hiding under the map when hurt
     ParkDepth = 60,          -- studs BELOW the ground surface we park (UI slider)
-    Mode = "pass",           -- "pass" -> fly THROUGH the nape (the only thing ever
-                             -- measured to land damage). "still" -> stand on the
-                             -- nape and swing: measured 0 damage, debug only
+    Mode = "auto",           -- "auto" (default) -> under the map while the nape
+                             -- expander is on, flying through the nape otherwise.
+                             -- "under"/"pass"/"still" force one of them
     peakSpeed = 0,           -- peak blade speed seen on the last pass (studs/s)
     state = "IDLE",
     reloadCooldownUntil = 0,
@@ -697,16 +797,46 @@ local function stopAttack()
     if hrp then hrp.Anchored = false end
 end
 
---// find the map's kill floor (lowest anchored geometry) so we can park below everything
+--// WHAT COUNTS AS GROUND — this is the fix for the park dragging you UP.
+--// The surface used to come from a plain raycast, so the first thing hit going
+--// down could be a TITAN, another player, or our own expanded nape hitbox (a size
+--// 200 box reaches ~100 studs above and below the neck). That "surface" was up in
+--// the air, so park Y = surface - depth placed you ABOVE the ground and the
+--// slider looked like it was pulling you up. Only real, anchored world geometry
+--// counts now — never titans, never characters, never the nape we expanded.
+local function isWorldGeometry(inst)
+    if not inst then return false end
+    if inst:IsA("Terrain") then return true end
+    if not inst:IsA("BasePart") then return false end
+    local T = workspace:FindFirstChild("Titans")
+    if T and inst:IsDescendantOf(T) then return false end
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local ch = pl.Character
+        if ch and inst:IsDescendantOf(ch) then return false end
+    end
+    if Nape.applied[inst] then return false end
+    if not inst.Anchored then return false end
+    return true
+end
+
+--// find the map's kill floor (lowest real geometry) — a fallback for the park
+--// when a raycast cannot find a surface at all
 local killFloorY
 local function computeKillFloor()
     local minY = math.huge
-    for _, p in ipairs(workspace:GetChildren()) do
-        if p:IsA("BasePart") and p.Anchored then
-            local bottom = p.Position.Y - p.Size.Y / 2
+    local function consider(inst)
+        if isWorldGeometry(inst) then
+            local bottom = inst.Position.Y - inst.Size.Y / 2
             if bottom < minY then minY = bottom end
         end
     end
+    local function walk(root, depth)
+        for _, c in ipairs(root:GetChildren()) do
+            consider(c)
+            if depth > 1 and (c:IsA("Model") or c:IsA("Folder")) then walk(c, depth - 1) end
+        end
+    end
+    walk(workspace, 3)
     killFloorY = (minY ~= math.huge and minY or 0) - 30
     Farm.killFloorAt = os.clock()
     return killFloorY
@@ -720,32 +850,43 @@ local function voidLimit()
     return fpdh + 15
 end
 
---// the park state (declared up here because parkY needs it)
-local Park = { on = false, x = 0, y = 0, z = 0, lastLog = 0, actual = 0, clamped = false, warnedAt = 0 }
+--// (the park state itself is declared at the top of the file — see THE PARK)
 
 --// WHERE THE GROUND IS, straight down from a point. v3.6 measured the park from
 --// the lowest anchored part in the whole workspace, which on a big map can be
 --// hundreds of studs from the floor you are actually standing on — so "60 below"
 --// was not 60 below anything. Depth is now measured from the surface under you,
 --// which is also what makes the depth slider mean something.
+--// one downward sweep, skipping anything that is not ground (it keeps going from
+--// just under each rejected hit, so a titan standing on the spot does not hide
+--// the floor beneath it)
+local function castGround(x, z, fromY, char)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = char and { char } or {}
+    local from = Vector3.new(x, fromY, z)
+    for _ = 1, 16 do
+        local hit = workspace:Raycast(from, Vector3.new(0, -6000, 0), params)
+        if not hit then return nil end
+        if isWorldGeometry(hit.Instance) then return hit.Position.Y, hit.Instance end
+        from = hit.Position - Vector3.new(0, 1.5, 0)
+    end
+    return nil
+end
+
 local function groundYAt(x, z)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    local ok, hit = pcall(function()
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = char and { char } or {}
-        --// from well above everything, so a park that is already deep cannot
-        --// hide the surface from us
-        local h = workspace:Raycast(Vector3.new(x, 2000, z), Vector3.new(0, -6000, 0), params)
-        --// a roof above us is not "the ground": re-cast from just under our feet
-        if h and hrp and h.Position.Y > hrp.Position.Y + 5 then
-            local lower = workspace:Raycast(Vector3.new(x, hrp.Position.Y + 5, z), Vector3.new(0, -6000, 0), params)
-            if lower then return lower end
+    local ok, y = pcall(function()
+        local high = castGround(x, z, 2000, char)
+        --// a roof above our head is not the ground: look from just under our feet
+        if high and hrp and high > hrp.Position.Y + 5 then
+            local low = castGround(x, z, hrp.Position.Y + 5, char)
+            if low then return low end
         end
-        return h
+        return high
     end)
-    if ok and hit and hit.Position then return hit.Position.Y, hit.Instance end
+    if ok and y then return y end
     return killFloorY or computeKillFloor()
 end
 
@@ -766,59 +907,6 @@ end
 --// reload state lives up here where the swing thread and the pass loop can read
 --// it (holdUntil = "do not swing on top of a reload in progress").
 local AutoReload = { Enabled = true, cooldown = 0, lastLog = 0, tries = 0, holdUntil = 0, quietUntil = 0 }
-
---// v3.5 THE PARK. v3.3 set the position ONCE and anchored the root — but the
---// gear's own physics module writes the HumanoidRootPart every frame, so the
---// player slid straight back out of the ground ("I'm still not under the
---// ground"). The park is now ENFORCED every frame instead of once, on both the
---// pre-simulation and Heartbeat steps, so nothing can overwrite it.
-local function parkTick()
-    if not Park.on then return end
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    --// never fight a respawn: while you are dead the engine is moving you, and
-    --// yanking the root back down mid-respawn is how you end up stuck falling
-    if not (hrp and hum and hum.Health > 0) then return end
-    --// PlatformStand stops the humanoid from pushing you back to your feet,
-    --// which is one of the things the gear's movement fights us with
-    if not hum.PlatformStand then pcall(function() hum.PlatformStand = true end) end
-    hrp.Anchored = true
-    hrp.CFrame = CFrame.new(Park.x, Park.y, Park.z)
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
-    Park.actual = hrp.Position.Y
-end
-
---// ENFORCED FROM EVERY STEP WE CAN GET. The gear writes the root from its own
---// loop, so a single Heartbeat write can lose the race: we assert the position
---// before the physics step, after it, in the render step, and last of all in a
---// render binding that runs AFTER the camera update.
-conns[#conns + 1] = RunService.Heartbeat:Connect(parkTick)
-pcall(function()
-    conns[#conns + 1] = RunService.PreSimulation:Connect(parkTick)
-end)
-pcall(function()
-    conns[#conns + 1] = RunService.RenderStepped:Connect(parkTick)
-end)
-pcall(function()
-    RunService:BindToRenderStep("HamasPark", Enum.RenderPriority.Camera.Value + 1, parkTick)
-end)
-
-local function stopPark()
-    if not Park.on then return end
-    Park.on = false
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hum then pcall(function() hum.PlatformStand = false end) end
-    if hrp then
-        hrp.Anchored = false
-        hrp.AssemblyLinearVelocity = Vector3.zero
-    end
-end
-
-getgenv().HamasAOT_StopPark = stopPark
 
 local function parkUnderPoint(x, z, reason)
     local char = LocalPlayer.Character
@@ -1058,6 +1146,75 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     end
 end)
 
+--// ===========================================================================
+--// UNDER-MAP ATTACK — what the nape expander is FOR.
+--//
+--// With "Expand Nape Hitboxes" on, the nape volume grows until it reaches BELOW
+--// the ground, and that is what lets you sit under the map — out of reach of
+--// every grab — while your blade volume still overlaps the nape. So this mode
+--// does NOT fly you out to the titan: it holds you exactly where the depth
+--// slider says, underneath the nape's X/Z, swinging the whole time. If the nape
+--// box cannot reach your depth it says so, with the Nape Size it needs — you turn
+--// it up in the Combat tab, which is your half of the deal. We never move you up
+--// to meet it: staying deep is the entire point.
+-- ===========================================================================
+local function napeReachY(nape)
+    return nape.Position.Y - (nape.Size.Y * 0.5)
+end
+
+local function underAttack(titan, seconds)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local np = titan and napeOf(titan)
+    if not (hum and hrp and np) then return false end
+    local blade = char:FindFirstChild("Hitbox")
+    local bladeTop = blade and (blade.Size.Y * 0.5) or 2
+    local t0 = os.clock()
+    local warnedAt = 0
+    while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
+        local cur = napeOf(titan)
+        if not (cur and cur.Parent and hum.Health > 0) then break end
+        --// exactly the depth the slider asks for, directly under the nape
+        Park.x, Park.z = cur.Position.X, cur.Position.Z
+        Park.y = parkY(Park.x, Park.z)
+        Park.on = true
+        parkTick()
+        --// can the expanded nape reach us? if not, name the Nape Size that would
+        local reach = napeReachY(cur)
+        local mine = Park.y + bladeTop
+        if reach > mine + 0.5 and (os.clock() - warnedAt) > 6 then
+            warnedAt = os.clock()
+            local grow = math.ceil((reach - mine) * 2 + 20)
+            Fluent:Notify({ Title = "HamasClient",
+                Content = ("Nape does not reach under the map — set Nape Size to about %d in Combat tab"):format(grow),
+                Duration = 5 })
+            if Debug then
+                Debug:Log("[Under] nape bottom Y", math.floor(reach), "| you at Y", math.floor(Park.y),
+                    "| raise Nape Size to ~" .. grow)
+            end
+        end
+        --// a synthesized touch pair on top of the real overlap
+        if blade and blade.Parent and firetouchinterest then
+            pcall(function()
+                firetouchinterest(cur, blade, 0)
+                firetouchinterest(cur, blade, 1)
+            end)
+        end
+        task.wait(0.05)
+    end
+    return true
+end
+
+--// how we attack this second: "auto" follows the nape expander, because an
+--// expanded nape is the only thing that can reach you under the map
+local function attackMode()
+    if Farm.Mode == "auto" then
+        return Nape.Enabled and "under" or "pass"
+    end
+    return Farm.Mode
+end
+
 --// fly through one titan's nape until it dies (or Dwell expires)
 local function passTitan(titan, seconds)
     local char = LocalPlayer.Character
@@ -1148,7 +1305,7 @@ local function killSweep()
         --// SPEED LADDER: if nothing has died after 6s of flying, the server is
         --// not accepting this pass speed — step it up (the captured real kill
         --// ran at ~247 studs/s, so we have somewhere real to aim for).
-        if Farm.Mode == "pass" and (os.clock() - lastStep) > 6 and Farm.kills <= killsAtStart then
+        if attackMode() == "pass" and (os.clock() - lastStep) > 6 and Farm.kills <= killsAtStart then
             lastStep = os.clock()
             if Farm.PassSpeed < Farm.PassMaxSpeed then
                 Farm.PassSpeed = math.min(Farm.PassMaxSpeed, math.floor(Farm.PassSpeed * 1.35))
@@ -1171,7 +1328,11 @@ local function killSweep()
         local target = nearestTitan()
         if not target then break end
         local before = #alive
-        passTitan(target, Farm.Dwell)
+        if attackMode() == "under" then
+            underAttack(target, Farm.Dwell)
+        else
+            passTitan(target, Farm.Dwell)
+        end
         local killed = before - #liveTitans()
         if killed > 0 then
             Farm.kills = Farm.kills + killed
@@ -1516,7 +1677,10 @@ local function setFarm(v)
         Farm.state = "IDLE"
     end
     if Debug then
-        Debug:Log("[Farm]", Farm.Enabled and (("ON (pass mode, %.0f studs/s, park Y %s)"):format(Farm.PassSpeed, tostring(math.floor(parkY())))) or "OFF")
+        Debug:Log("[Farm]", Farm.Enabled
+            and (("ON (mode %s, %.0f studs/s, park %d deep, Y %s)"):format(
+                attackMode(), Farm.PassSpeed, Farm.ParkDepth, tostring(math.floor(parkY()))))
+            or "OFF")
     end
     Fluent:Notify({ Title = "HamasClient",
         Content = Farm.Enabled and ("Auto farm ON — flying through napes at %d studs/s"):format(Farm.PassSpeed) or "Auto farm OFF",
@@ -1524,9 +1688,9 @@ local function setFarm(v)
 end
 getgenv().HamasAOT_Farm = Farm
 getgenv().HamasAOT_FarmSet = setFarm   -- getgenv().HamasAOT_FarmSet(true|false)
-getgenv().HamasAOT_SetMode = function(m)  -- "pass" (default) | "still"
+getgenv().HamasAOT_SetMode = function(m)  -- "auto" | "under" | "pass" | "still"
     if m == "sweep" then m = "pass" end
-    if m == "still" or m == "pass" then
+    if m == "still" or m == "pass" or m == "under" or m == "auto" then
         Farm.Mode = m
         return "mode=" .. m
     end
@@ -1611,13 +1775,17 @@ TP:CreateButton({ Title = "Teleport to closest blades",
     Description = "Blade / gas supply — always teleports, no distance limit",
     Callback = function()
         Fluent:Notify({ Title = "HamasClient", Content = "Teleporting to the closest blade supply...", Duration = 2 })
-        local ok, err, dist = teleportToClosestBlades()
+        local ok, err, dist, name = teleportToClosestBlades()
         if not ok then
             Fluent:Notify({ Title = "HamasClient", Content = "Blade teleport: " .. tostring(err), Duration = 3 })
         else
-            Fluent:Notify({ Title = "HamasClient", Content = "At the blades" .. (dist and string.format(" (%dm)", math.floor(dist + 0.5)) or ""), Duration = 2 })
+            Fluent:Notify({ Title = "HamasClient",
+                Content = ("At the blades%s (%s)"):format(
+                    dist and string.format(" (%dm)", math.floor(dist + 0.5)) or "",
+                    tostring(name or "?")),
+                Duration = 2 })
         end
-        if Debug then Debug:Log("[TP] blades:", tostring(ok), tostring(err), dist and string.format("%.0fm", dist) or "") end
+        if Debug then Debug:Log("[TP] blades:", tostring(ok), tostring(err), dist and string.format("%.0fm", dist) or "", tostring(name)) end
     end })
 TP:CreateButton({ Title = "Teleport to AOT Mission",
     Description = "Straight into the mission place — same hop the farm uses when the lobby stalls",
@@ -1687,4 +1855,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.8 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.9 loaded, place:", game.PlaceId)
+pcall(function()
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.9 loaded", Duration = 3 })
+end)

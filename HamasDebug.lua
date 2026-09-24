@@ -35,9 +35,28 @@ local function fmt(kind, msg)
     return string.format("%s%s %s", ts(), PREFIX[kind] or "", msg)
 end
 
+--// Mirror every line into the executor workspace as well: you asked me to check
+--// the logs, and an in-memory ring buffer cannot be read after the fact. The file
+--// is capped in size and rotated so it can never grow without bound.
+local LOGFILE = "HamasDebug.log"
+local LOGFILE_MAX = 300000
+
 function Debug:Push(kind, msg)
     local line = fmt(kind, tostring(msg))
     table.insert(self.Buffer, line)
+    --// write the whole buffer (not just the new line): that way it works whether
+    --// or not this executor has appendfile, and the file always ends up matching
+    --// what the Debug tab shows
+    pcall(function()
+        if not writefile then return end
+        --// at most ~4 disk writes a second, and each write is the whole buffer, so
+        --// the file is never more than a quarter second behind the Debug tab
+        if os.clock() - (self.logAt or 0) < 0.25 then return end
+        self.logAt = os.clock()
+        local txt = table.concat(self.Buffer, "\n")
+        if #txt > LOGFILE_MAX then txt = txt:sub(-LOGFILE_MAX) end
+        writefile(LOGFILE, txt)
+    end)
     if #self.Buffer > self.MaxBuffer then
         table.remove(self.Buffer, 1)
     end
@@ -164,8 +183,22 @@ function Debug:Attach(cfg)
         end
     end)
 
+    --// fresh log per session, unless the previous one is still small enough to
+    --// be useful (which keeps the tail of the previous session for comparison)
+    pcall(function()
+        if isfile and readfile and writefile then
+            local size = isfile(LOGFILE) and #readfile(LOGFILE) or 0
+            if size > LOGFILE_MAX then
+                writefile(LOGFILE, "")
+                size = 0
+            end
+            self.logBytes = size
+        end
+    end)
+
     self.Attached = true
     self:Push("ok", "debug console attached")
+    self:Push("ok", "log mirrored to " .. LOGFILE)
     return self
 end
 

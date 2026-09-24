@@ -9,6 +9,13 @@
 
 local RAW = "https://raw.githubusercontent.com/Chris5313/Hamas-Roblox/main/"
 
+--// Every raw fetch gets a unique query string. Synapse caches HttpGet results per
+--// URL, so without this a fix can be pushed and you still load yesterday's file —
+--// which is exactly how "the bug came back" happens.
+local function busted(url)
+    return url .. (url:find("?", 1, true) and "&" or "?") .. "v=" .. tostring(os.time()) .. tostring(math.random(1000, 9999))
+end
+
 if not getgenv().HamasLoad then
     getgenv().HamasLoad = function(name)
         local src
@@ -16,7 +23,7 @@ if not getgenv().HamasLoad then
             pcall(function() src = readfile(name) end)
         end
         if not src or #src == 0 then
-            local ok, res = pcall(function() return game:HttpGet(RAW .. name, true) end)
+            local ok, res = pcall(function() return game:HttpGet(busted(RAW .. name), true) end)
             assert(ok, "[Hamas] cannot resolve module: " .. tostring(name) ..
                 " (not in executor workspace and GitHub fetch failed)")
             src = res
