@@ -6,6 +6,17 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.4: REAL-MOTION PASS. A hand-kill capture proved the geometry of a kill:
+--//        at the instant the server credited the nape hit, the blade parts were
+--//        moving at ~247 studs/s, and incoming ( Effects, Hit, <titan>, Nape )
+--//        is how you know it landed. Nothing was sent by the client — damage is
+--//        credited only to a blade that is REALLY touching the nape at speed.
+--//        That kills CFrame teleporting forever: a teleported part produces no
+--//        physics contact, so v3.3's "hard steering" could never deal damage.
+--//        We now fly the character with a LinearVelocity constraint (the solver
+--//        applies it AFTER scripts, so the gear's per-frame velocity writes
+--//        cannot eat it): honest, replicated, high-speed motion through the
+--//        nape — < - titan -> — with the blade swinging the whole way.
 --// v3.3: SWEEP KILL — damage needs the blade MOVING THROUGH the hitbox, so the
 --//        farm flies you fast back and forth across each titan's nape, swinging
 --//        on the way through  (< - titan -> ). Under the map is only where you
@@ -33,7 +44,7 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "3.3",
+    Version = "3.4",
     Debug = true,
     Tabs = {
         { Title = "Farming",  Icon = "wheat" },
@@ -396,14 +407,21 @@ local Farm = {
     RetreatHP = 30,          -- below this HP -> dive under the map to heal up
     AutoTeleport = false,    -- OFF: never move the player between games
     --// internals (no UI: they are not worth a slider)
-    Dwell = 2,               -- seconds sweeping one titan before moving on
-    SweepReach = 26,         -- max studs either side of the nape (auto-tightened)
-    SweepSpeed = 300,        -- studs/s ceiling while sweeping
-    SweepGain = 11,          -- how hard we steer toward the far side of the nape
+    Dwell = 2,               -- seconds flying through one titan before moving on
+    PassSpeed = 240,         -- studs/s held THROUGH the nape. A captured manual kill
+                             -- peaked at ~247 studs/s, so we match the real thing
+    PassReach = 30,          -- studs either side of the nape = how long one pass is
+    PassForce = 300000,      -- the constraint's MaxForce: has to beat the gear's own
+                             -- physics module, which rewrites velocity every frame
+    PassMaxSpeed = 520,      -- ceiling for the automatic speed ladder
+    UseBoost = true,         -- if we are not actually going that fast, tap the
+                             -- game's own ODM boost (Input.Action("Boost"))
     RetreatTime = 2,         -- seconds hiding under the map when hurt
     ParkDepth = 150,         -- studs BELOW the map's killfloor we park
-    Mode = "still",           -- "still" -> stand + swing, "sweep" -> fly through;
-                              -- the farm steps itself up if still swings do nothing
+    Mode = "pass",           -- "pass" -> fly THROUGH the nape (the only thing ever
+                             -- measured to land damage). "still" -> stand on the
+                             -- nape and swing: measured 0 damage, debug only
+    peakSpeed = 0,           -- peak blade speed seen on the last pass (studs/s)
     state = "IDLE",
     reloadCooldownUntil = 0,
     lastHop = -1e6,            -- throttle for cross-place teleports
@@ -594,12 +612,20 @@ end
 
 --// --- the OP kill: firetouchinterest burst, zero clicks/swings
 local Attack = { active = false }
-local Sweep = { active = false, titan = nil, side = 1, axis = Vector3.new(1, 0, 0), frame = 0 }
+local Sweep = { active = false, titan = nil, side = 1, axis = Vector3.new(1, 0, 0), frame = 0,
+                driver = nil, peak = 0, speed = 0, boostAt = 0, slowSince = nil, passes = 0 }
+
+local function releasePassDriver()
+    local d = Sweep.driver
+    Sweep.driver = nil
+    if d then pcall(function() d:Destroy() end) end
+end
 
 local function stopAttack()
     Attack.active = false
     Sweep.active = false
     Sweep.titan = nil
+    releasePassDriver()
     local ch = LocalPlayer.Character
     local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
     if hrp then hrp.Anchored = false end
@@ -649,14 +675,23 @@ end
 --// (nape sizing is owned by the Combat tab's hitbox expander — the farm does
 --// not touch it, so there is exactly one place to control it)
 
---// v3.3 THE SWEEP — how this game's blade damage actually lands.
---// Standing still inside the nape deals NOTHING (measured live), because the
---// server validates a blade that is MOVING THROUGH the hitbox. So the farm
---// flies you back and forth across the nape at full framerate and swings:
---//
+--// v3.4 THE PASS — how this game's blade damage actually lands.
+--// A capture of a real hand-kill says it plainly: at the instant of the nape
+--// hit the blade parts were doing ~247 studs/s, the client sent NOTHING, and the
+--// only trace was the server's own incoming ( Effects, Hit, <titan>, Nape ).
+--// So damage is credited to a blade that is REALLY touching the nape, at speed,
+--// under physics. Consequences:
+--//   * standing still on the nape deals NOTHING (measured, repeatedly)
+--//   * CFrame teleporting deals NOTHING: a teleported part generates no physics
+--//     contact, and an ANCHORED part generates none at all (v3.3 fell back to
+--//     exactly those two, which is why it swung forever and never killed)
+--//   * a hand-written AssemblyLinearVelocity is thrown away before the physics
+--//     step, because the gear's own physics module rewrites it every frame
+--// The fix: a LinearVelocity constraint, which the solver applies AFTER scripts,
+--// so it survives: straight through the nape, flipping sides at each end —
 --//            < --- titan --- >
---//         A  ->  nape  ->  B  ->  nape  ->  A   (both ways, every frame)
---//
+--//         A  ->  nape  ->  B  ->  nape  ->  A
+--// Real motion, no teleports, no shake, and the same speed the game itself uses.
 --// Under the map is only where you wait (no titans, or hurt) — never where you
 --// fight.
 --// THE GAME'S OWN ACTION NAMES. Storage.Actions.Computer lists every real
@@ -706,8 +741,43 @@ local function swing()
     pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0) end)
 end
 
---// one sweep frame: fly the character to the far side of the nape. Runs on
---// Heartbeat (never yields) so the back-and-forth is as fast as the client.
+--// the driver: one LinearVelocity on the HRP, world-space, aimed by us every frame
+local function ensurePassDriver(hrp)
+    local d = Sweep.driver
+    if d and d.Parent == hrp then return d end
+    releasePassDriver()
+    local ok, made = pcall(function()
+        local att = Instance.new("Attachment")
+        att.Name = "HamasPassAttachment"
+        att.Parent = hrp
+        local lv = Instance.new("LinearVelocity")
+        lv.Name = "HamasPassDriver"
+        lv.Attachment0 = att
+        lv.RelativeTo = Enum.ActuatorRelativeTo.World
+        lv.MaxForce = Farm.PassForce
+        lv.VectorVelocity = Vector3.zero
+        lv.Parent = hrp
+        return lv
+    end)
+    if not ok or not made then return nil end
+    Sweep.driver = made
+    return made
+end
+
+--// the lane: a level line through the nape, across the titan's facing, so we
+--// cross the nape surface instead of burrowing into the body
+local function laneAxis(np, hrp)
+    local ok, right = pcall(function() return np.CFrame.RightVector end)
+    if ok and right then
+        right = Vector3.new(right.X, 0, right.Z)
+        if right.Magnitude > 0.1 then return right.Unit end
+    end
+    local flat = Vector3.new(np.Position.X - hrp.Position.X, 0, np.Position.Z - hrp.Position.Z)
+    if flat.Magnitude > 0.1 then return Vector3.new(-flat.Z, 0, flat.X).Unit end
+    return Vector3.new(1, 0, 0)
+end
+
+--// one pass frame. Never yields, so the back-and-forth is as fast as the client.
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if not Sweep.active then return end
     local char = LocalPlayer.Character
@@ -716,36 +786,56 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     local np = Sweep.titan and napeOf(Sweep.titan)
     if not (hum and hrp and np and np.Parent and hum.Health > 0) then return end
 
-    local center = np.Position
-    local reach = math.max(8, math.min(Farm.SweepReach, (math.max(np.Size.X, np.Size.Z) * 0.5) + 6))
-    local target = center + Sweep.axis * (reach * Sweep.side)
-    hrp.Anchored = false
+    --// titans turn; re-aim the lane a few times a second, not every frame
+    if not Sweep.axisAt or os.clock() > Sweep.axisAt then
+        Sweep.axis = laneAxis(np, hrp)
+        Sweep.axisAt = os.clock() + 0.25
+    end
 
-    if Sweep.hard then
-        --// the engine refuses to keep our velocity (the game's own ODM physics
-        --// re-writes it) -> fall back to steering by position
-        hrp.CFrame = CFrame.new(target)
+    local driver = ensurePassDriver(hrp)
+    local center = np.Position
+    local reach = math.max(10, Farm.PassReach)
+    hrp.Anchored = false -- an anchored part produces no touches at all
+    local delta = (center + Sweep.axis * (reach * Sweep.side)) - hrp.Position
+    if delta.Magnitude < 4 then
         Sweep.side = -Sweep.side
+        delta = (center + Sweep.axis * (reach * Sweep.side)) - hrp.Position
+    end
+    local dir = delta.Magnitude > 0.01 and delta.Unit or Sweep.axis
+
+    if driver then
+        driver.VectorVelocity = dir * Farm.PassSpeed
     else
-        --// smooth: steer with velocity so the camera does not shake and the
-        --// server sees honest fast movement through the hitbox
-        local delta = target - hrp.Position
-        if delta.Magnitude < 3 then Sweep.side = -Sweep.side end
-        local vel = delta * Farm.SweepGain
-        if vel.Magnitude > Farm.SweepSpeed then vel = vel.Unit * Farm.SweepSpeed end
-        hrp.AssemblyLinearVelocity = vel
-        hrp.AssemblyAngularVelocity = Vector3.zero
-        --// if we are not actually covering ground, switch to hard steering
-        Sweep.checkAt = Sweep.checkAt or (os.clock() + 0.4)
-        Sweep.checkFrom = Sweep.checkFrom or hrp.Position
-        if os.clock() > Sweep.checkAt then
-            if (hrp.Position - Sweep.checkFrom).Magnitude < 6 then Sweep.hard = true end
-            Sweep.checkAt = nil
-            Sweep.checkFrom = nil
+        --// no constraint on this executor build -> best effort only
+        hrp.AssemblyLinearVelocity = dir * Farm.PassSpeed
+    end
+    hrp.AssemblyAngularVelocity = Vector3.zero
+
+    --// how fast are we ACTUALLY going? The hand-kill peaked at ~247 studs/s;
+    --// if this reads 10, nothing will ever land and we say so in the log.
+    local blade = char:FindFirstChild("Hitbox") or hrp
+    local spd = blade.AssemblyLinearVelocity.Magnitude
+    Sweep.speed = spd
+    if spd > Sweep.peak then
+        Sweep.peak = spd
+        Farm.peakSpeed = spd
+    end
+
+    --// the constraint is losing to the gear's physics -> borrow the gear's own
+    --// boost, which accelerates you the way the real ODM dash does
+    if Farm.UseBoost and driver then
+        if spd < Farm.PassSpeed * 0.4 then
+            Sweep.slowSince = Sweep.slowSince or os.clock()
+            if os.clock() - Sweep.slowSince > 0.5 and os.clock() > Sweep.boostAt then
+                Sweep.boostAt = os.clock() + 0.6
+                action("Boost")
+            end
+        else
+            Sweep.slowSince = nil
         end
     end
 
-    --// free touch pair every pass (helps on builds that accept synthesized touches)
+    --// a free touch pair every frame, on top of the real contacts physics gives us
     local hb = char:FindFirstChild("Hitbox")
     if hb and firetouchinterest then
         pcall(function()
@@ -753,36 +843,37 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
             firetouchinterest(np, hb, 1)
         end)
     end
-
 end)
 
 --// fly through one titan's nape until it dies (or Dwell expires)
-local function sweepTitan(titan, seconds)
+local function passTitan(titan, seconds)
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     local np = titan and napeOf(titan)
     if not (hum and hrp and np) then return false end
-    --// the lane is the line we came in on, levelled out: < --- titan --- >
-    local flat = (np.Position - hrp.Position) * Vector3.new(1, 0, 1)
-    Sweep.axis = (flat.Magnitude > 3) and flat.Unit or Vector3.new(1, 0, 0)
-    --// get to the lane first (any distance), then sweep
-    if (np.Position - hrp.Position).Magnitude > 40 then
-        teleportTo(np.Position - Sweep.axis * 10)
+    Sweep.axis = laneAxis(np, hrp)
+    Sweep.axisAt = os.clock() + 0.25
+    --// getting onto the lane may be a teleport (any distance) — that is fine,
+    --// because the hit we need happens under real physics motion afterwards
+    if (np.Position - hrp.Position).Magnitude > 30 then
+        hrp.Anchored = false
+        teleportTo(np.Position - Sweep.axis * Farm.PassReach)
     end
     Sweep.titan = titan
     Sweep.side = 1
     Sweep.frame = 0
-    Sweep.hard = false
-    Sweep.checkAt = nil
-    Sweep.checkFrom = nil
+    Sweep.peak = 0
+    Sweep.slowSince = nil
+    Sweep.passes = (Sweep.passes or 0) + 1
     Sweep.active = (Farm.Mode ~= "still")
+    if Sweep.active then ensurePassDriver(hrp) end
     local t0 = os.clock()
     while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
         if not (np.Parent and hum.Health > 0) then break end
         if Farm.Mode == "still" then
-            --// "still" mode: sit exactly on the nape and just swing. No movement
-            --// at all — this works if the server only cares about the swing.
+            --// "still" mode (debug only): sit exactly on the nape and swing.
+            --// Measured live: this deals NOTHING — the blade has to be moving.
             local cur = napeOf(titan) or np
             if cur.Parent then
                 hrp.Anchored = false
@@ -794,6 +885,11 @@ local function sweepTitan(titan, seconds)
     end
     Sweep.active = false
     Sweep.titan = nil
+    releasePassDriver()
+    if Debug and Sweep.peak > 0 then
+        Debug:Log(string.format("[Pass] peak blade speed %.0f studs/s (holding %.0f, a real kill is ~247)",
+            Sweep.peak, Farm.PassSpeed))
+    end
     return true
 end
 
@@ -826,18 +922,24 @@ local function killSweep()
         end
     end)
 
-    local modeStart, killsAtStart = os.clock(), Farm.kills
+    local modeStart, lastStep = os.clock(), os.clock()
+    local killsAtStart = Farm.kills
     while Attack.active and Farm.Enabled do
         local alive = liveTitans()
         if #alive == 0 then break end
 
-        --// SMART LADDER: start with the least invasive method (stand on the nape
-        --// and swing — no movement, no shaking). If nothing dies from that, step
-        --// up to sweeping through the hitbox at speed.
-        if Farm.Mode == "still" and (os.clock() - modeStart) > 7 and Farm.kills <= killsAtStart then
-            Farm.Mode = "sweep"
-            if Debug then Debug:Log("[Farm] still swings land nothing — switching to sweep") end
-            Fluent:Notify({ Title = "HamasClient", Content = "Still swings deal no damage — using the fast sweep", Duration = 3 })
+        --// SPEED LADDER: if nothing has died after 6s of flying, the server is
+        --// not accepting this pass speed — step it up (the captured real kill
+        --// ran at ~247 studs/s, so we have somewhere real to aim for).
+        if Farm.Mode == "pass" and (os.clock() - lastStep) > 6 and Farm.kills <= killsAtStart then
+            lastStep = os.clock()
+            if Farm.PassSpeed < Farm.PassMaxSpeed then
+                Farm.PassSpeed = math.min(Farm.PassMaxSpeed, math.floor(Farm.PassSpeed * 1.35))
+                if Debug then Debug:Log("[Farm] nothing dying — pass speed ->", Farm.PassSpeed, "studs/s") end
+                Fluent:Notify({ Title = "HamasClient",
+                    Content = ("Nothing dying yet — pass speed %d studs/s (peak blade %.0f)"):format(Farm.PassSpeed, Sweep.peak),
+                    Duration = 3 })
+            end
         end
 
         --// hurt -> dive under the map until the grab is off you
@@ -852,9 +954,13 @@ local function killSweep()
         local target = nearestTitan()
         if not target then break end
         local before = #alive
-        sweepTitan(target, Farm.Dwell)
+        passTitan(target, Farm.Dwell)
         local killed = before - #liveTitans()
-        if killed > 0 then Farm.kills = Farm.kills + killed end
+        if killed > 0 then
+            Farm.kills = Farm.kills + killed
+            Fluent:Notify({ Title = "HamasClient",
+                Content = ("Titan down — %d at %.0f studs/s"):format(killed, Sweep.peak), Duration = 2 })
+        end
 
         --// remember somewhere sane to put the player back when the farm stops
         local c = LocalPlayer.Character
@@ -1121,13 +1227,18 @@ local function setFarm(v)
         end
         Farm.state = "IDLE"
     end
-    if Debug then Debug:Log("[Farm]", Farm.Enabled and ("ON (sweep mode, park Y %s)"):format(tostring(math.floor(parkY()))) or "OFF") end
-    Fluent:Notify({ Title = "HamasClient", Content = Farm.Enabled and "Auto farm ON — sweep mode" or "Auto farm OFF", Duration = 2 })
+    if Debug then
+        Debug:Log("[Farm]", Farm.Enabled and (("ON (pass mode, %.0f studs/s, park Y %s)"):format(Farm.PassSpeed, tostring(math.floor(parkY())))) or "OFF")
+    end
+    Fluent:Notify({ Title = "HamasClient",
+        Content = Farm.Enabled and ("Auto farm ON — flying through napes at %d studs/s"):format(Farm.PassSpeed) or "Auto farm OFF",
+        Duration = 2 })
 end
 getgenv().HamasAOT_Farm = Farm
 getgenv().HamasAOT_FarmSet = setFarm   -- getgenv().HamasAOT_FarmSet(true|false)
-getgenv().HamasAOT_SetMode = function(m)  -- "still" | "sweep"
-    if m == "still" or m == "sweep" then
+getgenv().HamasAOT_SetMode = function(m)  -- "pass" (default) | "still"
+    if m == "sweep" then m = "pass" end
+    if m == "still" or m == "pass" then
         Farm.Mode = m
         return "mode=" .. m
     end
@@ -1138,6 +1249,9 @@ getgenv().HamasAOT_FarmStatus = function()
         enabled = Farm.Enabled, state = Farm.state, kills = Farm.kills,
         titans = #liveTitans(), place = game.PlaceId, lobby = inLobby(),
         aot = isAOTPlace(), parkY = math.floor(parkY()), nape = Nape.Size,
+        mode = Farm.Mode, passSpeed = Farm.PassSpeed,
+        lastPeakBladeSpeed = math.floor(Sweep.peak or 0), bestBladeSpeed = math.floor(Farm.peakSpeed or 0),
+        passes = Sweep.passes, driver = Sweep.driver and true or false,
     }
 end
 
@@ -1154,13 +1268,16 @@ end
 local F = Tabs.Farming
 F:CreateSection("Auto Farm (Missions)")
 local FarmToggle = F:CreateToggle("AOT_FarmMaster", { Title = "Auto Farm",
-    Description = "Flies you back and forth across titan napes, swinging, then retries the mission",
+    Description = "Flies you through titan napes fast enough to cut them, swinging the whole way, then retries the mission",
     Default = false, Callback = setFarm })
 F:CreateToggle("AOT_FarmAutoTP", { Title = "Auto-teleport me into AOT", Default = false,
     Description = "Off = the farm never moves you between games; it only farms where you already are",
     Callback = function(v) Farm.AutoTeleport = v end })
-F:CreateSlider("AOT_FarmSwing", { Title = "Swing interval (s)", Description = "Lower = more swings per sweep", Default = 0.12, Min = 0.05, Max = 0.6, Rounding = 2,
+F:CreateSlider("AOT_FarmSwing", { Title = "Swing interval (s)", Description = "Lower = more swings per pass", Default = 0.12, Min = 0.05, Max = 0.6, Rounding = 2,
     Callback = function(v) Farm.SwingDelay = v end })
+F:CreateSlider("AOT_FarmPass", { Title = "Pass speed (studs/s)", Default = 240, Min = 60, Max = 520, Rounding = 0,
+    Description = "How fast you cross the nape. Real killing swings run ~247 — too slow deals nothing, and the farm raises this on its own if kills stall",
+    Callback = function(v) Farm.PassSpeed = v end })
 F:CreateSlider("AOT_FarmRetreat", { Title = "Hide under map below HP %", Default = 30, Min = 0, Max = 80, Rounding = 0,
     Description = "Dives under the map to shake off a grab, then comes back out",
     Callback = function(v) Farm.RetreatHP = v end })
@@ -1269,4 +1386,4 @@ local function tryResume(attempt)
 end
 tryResume(1)
 
-print("[Hamas] AOT Revolution v3.3 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.4 loaded, place:", game.PlaceId)
