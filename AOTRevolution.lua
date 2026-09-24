@@ -6,6 +6,14 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.24: MOVE ON THE INSTANT A TITAN DIES. "It attacks the same place after a
+--//        titan dies." The server's HP update and hitbox removal lag the kill,
+--//        so the corpse still counted as live and got re-picked (or kept the
+--//        lane until its nape despawned). Three fixes, applied EVERYWHERE: the
+--//        attack loops exit the moment the target's HP reads 0 (under AND pass
+--//        mode), a dead titan is blacklisted for 3s in a shared corpse filter
+--//        that every picker honours (nearestTitan, parkIdle, the farm loop),
+--//        and the next lane therefore always starts on a live titan.
 --// v3.23: SPEED YOU CAN SEE. "3 nape hits per kill — am I too slow?" No: the
 --//        lane already holds 240 studs/s and the captured real kill ran ~247.
 --//        Per-slash damage is the server's (your gear tier). But speed IS part
@@ -962,6 +970,13 @@ local function napeOf(titan)
     return hit and hit:FindFirstChild("Nape")
 end
 
+--// v3.24: CORPSE FILTER, shared by every picker. After a kill the server's
+--// Health update and hitbox removal can lag a moment — the dead titan still has
+--// a nape part and HP>0 client-side, so the farm kept "attacking the same
+--// place". Anything registered here is skipped for 3 seconds, everywhere:
+--// nearestTitan, parkIdle, the farm loop.
+local recentDead = {}
+
 local function liveTitans()
     local T = workspace:FindFirstChild("Titans")
     if not T then return {} end
@@ -988,12 +1003,16 @@ local function nearestTitan()
     --// it), so vertical separation is free: rank by flat distance first.
     local best, bestD, bestAlt, bestAltD
     for _, t in ipairs(liveTitans()) do
-        local nape = napeOf(t)
-        local d = (nape.Position - hrp.Position).Magnitude
-        if math.abs(nape.Position.Y - hrp.Position.Y) <= 300 then
-            if not bestD or d < bestD then best, bestD = t, d end
+        --// v3.24: never re-pick a registered corpse (3s cool-off, lazy purge)
+        if recentDead[t] and os.clock() >= recentDead[t] then recentDead[t] = nil end
+        if not recentDead[t] then
+            local nape = napeOf(t)
+            local d = (nape.Position - hrp.Position).Magnitude
+            if math.abs(nape.Position.Y - hrp.Position.Y) <= 300 then
+                if not bestD or d < bestD then best, bestD = t, d end
+            end
+            if not bestAltD or d < bestAltD then bestAlt, bestAltD = t, d end
         end
-        if not bestAltD or d < bestAltD then bestAlt, bestAltD = t, d end
     end
     return best or bestAlt, bestD or bestAltD
 end
@@ -2090,6 +2109,13 @@ local function underAttack(titan, seconds)
     while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
         local cur = napeOf(titan)
         if not (cur and cur.Parent and hum.Health > 0) then break end
+        --// v3.24: the target is DEAD — leave the instant the server says so,
+--//        do not keep sweeping the corpse while the death animation plays
+        do
+            local tmx = cur:FindFirstAncestorOfClass("Model")
+            local thx = tmx and tmx:FindFirstChildOfClass("Humanoid")
+            if thx and thx.Health <= 0 then break end
+        end
 
         --// v3.18 — NEVER RISE INTO THE STOMP. v3.17 climbed you up to meet the nape
         --// whenever the nape could not reach your depth. That parked you just under
@@ -2206,6 +2232,12 @@ local function passTitan(titan, seconds)
     local t0 = os.clock()
     while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
         if not (np.Parent and hum.Health > 0) then break end
+        --// v3.24: same dead-target exit for pass mode
+        do
+            local tmx = np:FindFirstAncestorOfClass("Model")
+            local thx = tmx and tmx:FindFirstChildOfClass("Humanoid")
+            if thx and thx.Health <= 0 then break end
+        end
         if Farm.Mode == "still" then
             --// "still" mode (debug only): sit exactly on the nape and swing.
             --// Measured live: this deals NOTHING — the blade has to be moving.
@@ -2327,6 +2359,11 @@ local function killSweep()
                 Content = ("Titan survived — attack speed %d studs/s"):format(Farm.PassSpeed), Duration = 3 })
         end
         local killed = before - #liveTitans()
+        --// v3.24: register the corpse — every picker skips it for 3s, so the
+--//        next lane starts on a LIVE titan even if its HP/nape linger a moment
+        if (killed > 0 or targetDown) and target then
+            recentDead[target] = os.clock() + 3
+        end
         if killed > 0 or targetDown then
             Farm.kills = Farm.kills + killed
             Fluent:Notify({ Title = "HamasClient",
@@ -3199,7 +3236,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.23 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.24 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.23 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.24 loaded", Duration = 3 })
 end)
