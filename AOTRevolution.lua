@@ -6,6 +6,14 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.7: the under-map park, properly. Depth is measured from the GROUND UNDER
+--//        YOU (a downward raycast) instead of from the lowest anchored part in
+--//        the workspace — on a big map those are hundreds of studs apart, which
+--//        is why "150 under" was not under anything. The park is asserted on
+--//        Heartbeat, pre-simulation, RenderStepped AND a render binding that
+--//        runs after the camera update, with PlatformStand on, and it verifies
+--//        1.5s later that it actually held (it tells you if something moves you
+--//        back). There is now a depth slider, and dragging it drops you in.
 --// v3.6: ONE SWITCH. Everything the farm needs folded into the Auto Farm toggle —
 --//        swing-timing patch, blade reload, under-map parking, mission retry —
 --//        and every tuning slider is gone. The farm only ever moves you inside
@@ -58,7 +66,7 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "3.6",
+    Version = "3.7",
     Debug = true,
     Tabs = {
         { Title = "Farming",  Icon = "wheat" },
@@ -438,7 +446,7 @@ local Farm = {
     UseBoost = true,         -- if we are not actually going that fast, tap the
                              -- game's own ODM boost (Input.Action("Boost"))
     RetreatTime = 2,         -- seconds hiding under the map when hurt
-    ParkDepth = 150,         -- studs BELOW the map's killfloor we park
+    ParkDepth = 60,          -- studs BELOW the ground surface we park (UI slider)
     Mode = "pass",           -- "pass" -> fly THROUGH the nape (the only thing ever
                              -- measured to land damage). "still" -> stand on the
                              -- nape and swing: measured 0 damage, debug only
@@ -668,12 +676,53 @@ local function computeKillFloor()
 end
 
 --// never park into the void-kill zone (server destroys parts below this)
-local function parkY()
+local function voidLimit()
     local fpdh = -500
     pcall(function() fpdh = workspace.FallenPartsDestroyHeight or -500 end)
     if fpdh > 0 then fpdh = -500 end
-    local floor = killFloorY or computeKillFloor()
-    return math.max(floor - Farm.ParkDepth, fpdh + 15)
+    return fpdh + 15
+end
+
+--// the park state (declared up here because parkY needs it)
+local Park = { on = false, x = 0, y = 0, z = 0, lastLog = 0, actual = 0, clamped = false, warnedAt = 0 }
+
+--// WHERE THE GROUND IS, straight down from a point. v3.6 measured the park from
+--// the lowest anchored part in the whole workspace, which on a big map can be
+--// hundreds of studs from the floor you are actually standing on — so "60 below"
+--// was not 60 below anything. Depth is now measured from the surface under you,
+--// which is also what makes the depth slider mean something.
+local function groundYAt(x, z)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local ok, hit = pcall(function()
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = char and { char } or {}
+        --// from well above everything, so a park that is already deep cannot
+        --// hide the surface from us
+        local h = workspace:Raycast(Vector3.new(x, 2000, z), Vector3.new(0, -6000, 0), params)
+        --// a roof above us is not "the ground": re-cast from just under our feet
+        if h and hrp and h.Position.Y > hrp.Position.Y + 5 then
+            local lower = workspace:Raycast(Vector3.new(x, hrp.Position.Y + 5, z), Vector3.new(0, -6000, 0), params)
+            if lower then return lower end
+        end
+        return h
+    end)
+    if ok and hit and hit.Position then return hit.Position.Y, hit.Instance end
+    return killFloorY or computeKillFloor()
+end
+
+--// "put me under the map by N studs" — N studs below the ground under you
+local function parkY(x, z)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not x and hrp then x = hrp.Position.X end
+    if not z and hrp then z = hrp.Position.Z end
+    local surface = (x and z) and groundYAt(x, z) or (killFloorY or computeKillFloor())
+    local limit = voidLimit()
+    local want = surface - Farm.ParkDepth
+    Park.clamped = want < limit
+    return math.max(want, limit)
 end
 
 --// Blades break after a few cuts and a broken blade deals no damage, so the
@@ -686,8 +735,6 @@ local AutoReload = { Enabled = true, cooldown = 0, lastLog = 0, tries = 0, holdU
 --// player slid straight back out of the ground ("I'm still not under the
 --// ground"). The park is now ENFORCED every frame instead of once, on both the
 --// pre-simulation and Heartbeat steps, so nothing can overwrite it.
-local Park = { on = false, x = 0, y = 0, z = 0, lastLog = 0 }
-
 local function parkTick()
     if not Park.on then return end
     local char = LocalPlayer.Character
@@ -696,22 +743,38 @@ local function parkTick()
     --// never fight a respawn: while you are dead the engine is moving you, and
     --// yanking the root back down mid-respawn is how you end up stuck falling
     if not (hrp and hum and hum.Health > 0) then return end
+    --// PlatformStand stops the humanoid from pushing you back to your feet,
+    --// which is one of the things the gear's movement fights us with
+    if not hum.PlatformStand then pcall(function() hum.PlatformStand = true end) end
     hrp.Anchored = true
     hrp.CFrame = CFrame.new(Park.x, Park.y, Park.z)
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
+    Park.actual = hrp.Position.Y
 end
 
+--// ENFORCED FROM EVERY STEP WE CAN GET. The gear writes the root from its own
+--// loop, so a single Heartbeat write can lose the race: we assert the position
+--// before the physics step, after it, in the render step, and last of all in a
+--// render binding that runs AFTER the camera update.
 conns[#conns + 1] = RunService.Heartbeat:Connect(parkTick)
 pcall(function()
     conns[#conns + 1] = RunService.PreSimulation:Connect(parkTick)
+end)
+pcall(function()
+    conns[#conns + 1] = RunService.RenderStepped:Connect(parkTick)
+end)
+pcall(function()
+    RunService:BindToRenderStep("HamasPark", Enum.RenderPriority.Camera.Value + 1, parkTick)
 end)
 
 local function stopPark()
     if not Park.on then return end
     Park.on = false
     local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hum then pcall(function() hum.PlatformStand = false end) end
     if hrp then
         hrp.Anchored = false
         hrp.AssemblyLinearVelocity = Vector3.zero
@@ -724,13 +787,32 @@ local function parkUnderPoint(x, z, reason)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    Park.x, Park.z, Park.y = x, z, parkY()
+    Park.x, Park.z = x, z
+    Park.y = parkY(x, z)
     Park.on = true
-    parkTick() -- put us there now; the connection keeps us there
-    if Debug and os.clock() - (Park.lastLog or 0) > 10 then
-        Park.lastLog = os.clock()
-        Debug:Log("[Park] under the map at Y", math.floor(Park.y), reason or "")
+    parkTick() -- put us there now; the connections keep us there
+    if Debug then
+        Debug:Log("[Park] under the map", math.floor(Farm.ParkDepth), "studs below the surface -> Y",
+            math.floor(Park.y), Park.clamped and "(clamped by the void limit)" or "", reason or "")
     end
+    --// verify it HELD. If the server or the gear yanks us back out we want to
+    --// know (and to say so) instead of silently standing in the open again.
+    local want = Park.y
+    task.delay(1.5, function()
+        if not Park.on or Park.y ~= want then return end
+        local c = LocalPlayer.Character
+        local h = c and c:FindFirstChild("HumanoidRootPart")
+        if not h then return end
+        local drift = math.abs(h.Position.Y - want)
+        if drift > 10 and os.clock() - (Park.warnedAt or 0) > 20 then
+            Park.warnedAt = os.clock()
+            if Debug then Debug:Log("[Park] NOT HOLDING: asked Y", math.floor(want), "but Y is", math.floor(h.Position.Y)) end
+            Fluent:Notify({ Title = "HamasClient",
+                Content = ("Park is not holding (asked Y %d, at Y %d) — something is moving you back")
+                    :format(math.floor(want), math.floor(h.Position.Y)),
+                Duration = 4 })
+        end
+    end)
 end
 
 --// the map is rebuilt every mission and we used to scan it once from the lobby,
@@ -1417,7 +1499,10 @@ getgenv().HamasAOT_FarmStatus = function()
         enabled = Farm.Enabled, state = Farm.state, kills = Farm.kills,
         titans = #liveTitans(), place = game.PlaceId, lobby = inLobby(),
         aot = isAOTPlace(), parkY = math.floor(parkY()), nape = Nape.Size,
-        parked = Park.on, parkAt = Park.y and math.floor(Park.y) or nil,
+        parked = Park.on, parkDepth = Farm.ParkDepth,
+        parkAt = Park.y and math.floor(Park.y) or nil,
+        parkActualY = Park.actual and math.floor(Park.actual) or nil,
+        parkClamped = Park.clamped,
         bladeHUD = (function()
             local have, max = bladeStats()
             return have and (have .. "/" .. max) or nil
@@ -1445,6 +1530,19 @@ F:CreateSection("Auto Farm")
 local FarmToggle = F:CreateToggle("AOT_FarmMaster", { Title = "Auto Farm",
     Description = "One switch for the lot: cuts every titan's nape, reloads your blades, hides you under the map when there is nothing to fight or you get low, and retries the next mission. It never touches your mouse, and it never leaves an AOT place.",
     Default = false, Callback = setFarm })
+F:CreateSlider("AOT_ParkDepth", { Title = "Under-map depth (studs)", Default = 60, Min = 10, Max = 600, Rounding = 0,
+    Description = "How far BELOW THE GROUND the farm hides you whenever there is nothing to fight, you get low, or you are between rounds. Drag it and he drops in straight away",
+    Callback = function(v)
+        Farm.ParkDepth = v
+        --// dragging it drops you in immediately, farm on or off: this is the
+        --// manual "put me under the map" control
+        parkIdle("depth slider")
+        Fluent:Notify({ Title = "HamasClient",
+            Content = ("Parking %d studs below the ground%s — now at Y %d"):format(v,
+                Park.clamped and " (as deep as this map's void limit allows)" or "",
+                math.floor(Park.y or 0)),
+            Duration = 2 })
+    end })
 
 local C = Tabs.Combat
 C:CreateSection("Nape Hitbox")
@@ -1519,6 +1617,7 @@ getgenv().HamasAOT_Shutdown = function()
     Farm.Enabled = false
     stopPark()
     stopAttack()
+    pcall(function() RunService:UnbindFromRenderStep("HamasPark") end)
 end
 
 --// ===========================================================================
@@ -1535,4 +1634,4 @@ local function tryResume(attempt)
 end
 tryResume(1)
 
-print("[Hamas] AOT Revolution v3.6 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.7 loaded, place:", game.PlaceId)
