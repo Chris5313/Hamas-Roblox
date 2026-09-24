@@ -168,6 +168,13 @@ end
 --// ---------- per-frame update ----------
 local function updateOne(entity, rec)
     local cam = workspace.CurrentCamera
+    --// v1.1: the camera is NIL during map/cutscene transitions (horror games do
+    --// this constantly). Dereferencing it blind threw "attempt to index nil"
+    --// every frame and surfaced as an executor error dialog.
+    if not cam then
+        for _, d in ipairs(rec.draws) do d.Visible = false end
+        return
+    end
     local camPos = cam.CFrame.Position
 
     local cf = livePivot(entity)
@@ -237,6 +244,7 @@ end
 
 --// ---------- tracking / delta rescan ----------
 local filterErrors = 0
+local updateErrors = 0
 local function eligible(inst, def)
     if not inst or not inst.Parent then return false end
     if not (inst:IsA("Model") or inst:IsA("BasePart")) then return false end
@@ -508,8 +516,19 @@ function ESP:Init(cfg)
             if not entity.Parent or not rec.def.Enabled then
                 if not entity.Parent then dropDraws(entity) else hideOne(rec) end
             else
-                updateOne(entity, rec)
-                drawn += 1
+                --// v1.1: a frame update can never spam executor error dialogs
+                --// again — the first 5 failures print to the console with the
+                --// real message, the rest are silent until a rescan fixes them
+                local okU, errU = pcall(updateOne, entity, rec)
+                if not okU then
+                    updateErrors += 1
+                    if updateErrors <= 5 then
+                        warn("[ESP] update error on '" .. tostring(entity.Name) .. "': " .. tostring(errU))
+                    end
+                    hideOne(rec)
+                else
+                    drawn += 1
+                end
             end
         end
         ESP.Stats.drawn = drawn

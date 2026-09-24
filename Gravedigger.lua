@@ -34,15 +34,23 @@ end
 --// kill any previous run's loops/watchers before reloading
 if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 
-local ctx = Base:Create({
-    GameName = "Gravedigger",
-    Version = "1.0",
-    Debug = true,
-    Tabs = {
-        { Title = "Main",     Icon = "home" },
-        { Title = "Visuals",  Icon = "eye" },
-    },
-})
+--// v1.1: init failures print their exact cause to the console instead of
+--// leaving you with a bare executor error box
+local okCtx, ctx = pcall(function()
+    return Base:Create({
+        GameName = "Gravedigger",
+        Version = "1.0",
+        Debug = true,
+        Tabs = {
+            { Title = "Main",     Icon = "home" },
+            { Title = "Visuals",  Icon = "eye" },
+        },
+    })
+end)
+if not okCtx or not ctx then
+    print("[Hamas] Gravedigger: base init FAILED:", tostring(ctx))
+    return
+end
 local Fluent, Window, Tabs, Debug, SaveManager = ctx.Fluent, ctx.Window, ctx.Tabs, ctx.Debug, ctx.SaveManager
 
 local Players = game:GetService("Players")
@@ -189,7 +197,12 @@ ESP:AddCategory({
     Filter = function(inst) return inst:IsA("Model") end,
 })
 
-ESP:Init{ Fluent = Fluent, Window = Window, Tab = Tabs.Visuals, Debug = Debug }
+do
+    local okE, errE = pcall(function()
+        ESP:Init{ Fluent = Fluent, Window = Window, Tab = Tabs.Visuals, Debug = Debug }
+    end)
+    print("[Hamas] Gravedigger: ESP init", okE and "ok" or ("FAILED: " .. tostring(errE)))
+end
 
 --// ===========================================================================
 --// Main tab — one button: dump every candidate model and how it classified.
