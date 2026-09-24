@@ -6,6 +6,21 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.23: SPEED YOU CAN SEE. "3 nape hits per kill — am I too slow?" No: the
+--//        lane already holds 240 studs/s and the captured real kill ran ~247.
+--//        Per-slash damage is the server's (your gear tier). But speed IS part
+--//        of the damage check (0 damage standing still — measured), so: a new
+--//        Attack Speed slider (60-520), an under-mode speed ladder (a titan that
+--//        survives its dwell window raises speed 1.3x, capped at 520), and a
+--//        per-target line "[Under] <name>: DOWN | N swings | X.Xs | peak S" —
+--//        hits-per-kill is now a number in the log, not a feeling.
+--// v3.22: STUCK-AFTER-KILL, FIXED. The lane heartbeat only checked its own
+--//        flag, so a dead under-attack thread meant sweeping one frozen lane
+--//        forever (90s of [Lane] after the last [Under] in the v3.21 log). The
+--//        heartbeat now tears the lane down itself when the attack loop is gone,
+--//        the farm loop contains attack errors and re-enters, and targets are
+--//        ranked by FLAT distance — from under the map, 3D distance chases a
+--//        titan 150 studs up instead of one beside you.
 --// v3.21: THE SELF, FOUND BY EVIDENCE. v3.20's log proves the hitbox stays on,
 --// the lane moves 1100+ studs/5s, the trigger fires (132 swings) and blades are
 --// clean — and still zero damage, because every module entry throws: require(host)
@@ -2019,7 +2034,7 @@ local function underAttack(titan, seconds)
 
     --// v3.22: remember this target's starting HP and say WHO we are attacking,
     --// so "stuck on one titan" vs "working the next one" is readable from the log
-    local hp0
+    local hp0, tname0, f0
     do
         local tm0 = np:FindFirstAncestorOfClass("Model")
         local th0 = tm0 and tm0:FindFirstChildOfClass("Humanoid")
@@ -2027,6 +2042,8 @@ local function underAttack(titan, seconds)
             Debug:Log("[Under] target", tm0 and tm0.Name or "?", "HP", th0 and math.floor(th0.Health) or "?")
         end
         hp0 = th0 and th0.Health or nil
+        tname0 = tm0 and tm0.Name or "?"
+        f0 = Trigger.fires or 0
     end
 
     --// the expander IS the mechanism: without it the nape can never reach under
@@ -2138,7 +2155,15 @@ local function underAttack(titan, seconds)
         Debug:Log(string.format("[Under] peak blade speed %.0f studs/s (holding %.0f, a real kill is ~247)",
             Sweep.peak, Farm.PassSpeed))
     end
-    return died
+    --// v3.23: the hits-per-kill line. "why is it taking me 3 nape hits to kill
+    --// one titan" is now a NUMBER per target, not a feeling — and the farm can
+    --// react to it (more speed when a target survives) instead of guessing.
+    local hits = (Trigger.fires or 0) - (f0 or 0)
+    if Debug then
+        Debug:Log(string.format("[Under] %s: %s | %d swings | %.1fs | peak %.0f studs/s",
+            tname0 or "?", died and "DOWN" or "survived", hits, os.clock() - t0, Sweep.peak or 0))
+    end
+    return died, hits
 end
 
 --// how we attack this second. v3.10: "auto" is ALWAYS under the map.
@@ -2278,15 +2303,28 @@ local function killSweep()
         --// (Attack.active stayed true, targeting never restarted, lane kept
         --// sweeping — the "stuck" report). Contain it, log it, reset cleanly:
         --// the farm loop re-enters killSweep on the next tick and re-targets.
-        local okAtk, errAtk, targetDown
+        local okAtk, errAtk, targetDown, hits
         if attackMode() == "under" then
-            okAtk, errAtk, targetDown = pcall(underAttack, target, Farm.UnderDwell)
+            okAtk, errAtk, targetDown, hits = pcall(underAttack, target, Farm.UnderDwell)
         else
             okAtk, errAtk = pcall(passTitan, target, Farm.Dwell)
         end
         if not okAtk then
             if Debug then Debug:Log("[Under] attack errored — resetting attack loop:", tostring(errAtk)) end
             stopAttack()
+        end
+        --// v3.23: SPEED LADDER for under mode. A titan that survives its whole
+        --// dwell window at the current speed gets MORE speed next time — speed is
+        --// the lever we own (the 0-damage-standing-still measurement proves speed
+        --// participates in the damage check). Per-slash DAMAGE is the server's
+        --// business; this only widens what we control.
+        if attackMode() == "under" and targetDown == false
+            and (os.clock() - lastStep) > 6 and Farm.PassSpeed < Farm.PassMaxSpeed then
+            lastStep = os.clock()
+            Farm.PassSpeed = math.min(Farm.PassMaxSpeed, math.floor(Farm.PassSpeed * 1.3))
+            if Debug then Debug:Log("[Farm] target survived — attack speed ->", Farm.PassSpeed, "studs/s") end
+            Fluent:Notify({ Title = "HamasClient",
+                Content = ("Titan survived — attack speed %d studs/s"):format(Farm.PassSpeed), Duration = 3 })
         end
         local killed = before - #liveTitans()
         if killed > 0 or targetDown then
@@ -3042,6 +3080,12 @@ F:CreateSlider("AOT_ParkDepth", { Title = "Under-map depth (studs)", Default = 6
                 math.floor(Park.y or 0)),
             Duration = 2 })
     end })
+F:CreateSlider("AOT_AttackSpeed", { Title = "Attack speed (studs/s)", Default = 240, Min = 60, Max = 520, Rounding = 0,
+    Description = "How fast the blade lane flies through a nape. The captured real kill ran ~247; per-slash damage is your gear's, but speed is part of the damage check, so faster CAN mean fewer hits per kill. If a titan survives its dwell window the farm raises this itself (never past 520).",
+    Callback = function(v)
+        Farm.PassSpeed = v
+        if Debug then Debug:Log("[Farm] attack speed set to", v, "studs/s") end
+    end })
 
 local C = Tabs.Combat
 C:CreateSection("Nape Hitbox")
@@ -3155,7 +3199,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.22 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.23 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.22 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.23 loaded", Duration = 3 })
 end)
