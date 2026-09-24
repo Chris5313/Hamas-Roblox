@@ -6,6 +6,10 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.6: ONE SWITCH. Everything the farm needs folded into the Auto Farm toggle —
+--//        swing-timing patch, blade reload, under-map parking, mission retry —
+--//        and every tuning slider is gone. The farm only ever moves you inside
+--//        AOT, and your mouse/keyboard are never synthesized.
 --// v3.5: fixes from live feedback. (1) Swinging no longer synthesizes mouse
 --//        input — it was moving the real cursor and clicking at screen centre
 --//        every SwingDelay, which made the menu unusable; the game's own Slash
@@ -54,7 +58,7 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "3.5",
+    Version = "3.6",
     Debug = true,
     Tabs = {
         { Title = "Farming",  Icon = "wheat" },
@@ -405,27 +409,25 @@ local function teleportToClosestBlades()
 end
 
 --// ===========================================================================
---// AUTO FARM v3.2 — OP mode
+--// AUTO FARM — ONE switch, everything else is automatic
 --//
---// How it kills: the farm drives the blade volume (character.Hitbox) through
---// each titan's Hitboxes/Hit/Nape every frame, fires a synthesized touch pair
---// for good measure, and sends the game's own swing (input action + a real
---// left click). Blade damage in this build is validated on the server from an
---// actual swing, so touch tricks alone are not enough — measured live: 0
---// damage from firetouchinterest bursts, contact, ODMG.M1 and Input.Slash
---// without the swing. You never click; the farm does.
---// Where you sit: ON the nape while killing, and parked deep UNDER THE MAP
---// (nape.X, KillFloorY - ParkDepth, nape.Z) whenever you are hurt, waiting, or
---// between rounds — that deep spot is untouchable, grabs never reach it.
+--// ON does all of it by itself: patches the gear's swing timing, flies you
+--// through every titan's nape  < - titan ->  at cutting speed while swinging,
+--// reloads your blades the moment a set is missing, parks you under the map
+--// whenever there is nothing to fight or you get low, retries the next mission,
+--// and re-arms itself only after a hop it caused.
+--// OFF stops all of it and hands your character back where it found you.
+--//
+--// What it never does: touch your mouse or keyboard (the game's own input
+--// actions drive it, so the menu stays yours), or leave an AOT place.
 --// ===========================================================================
 local Farm = {
     Enabled = false,
-    --// the only four things you actually tune
-    SwingDelay = 0.12,       -- seconds between swings while sweeping
+    --// tuned values (there is no UI for these: one toggle IS the interface)
+    SwingDelay = 0.12,       -- seconds between swings while passing
     GasThreshold = 15,       -- refill blades/gas below this %
     RetreatHP = 30,          -- below this HP -> dive under the map to heal up
-    AutoTeleport = false,    -- OFF: never move the player between games
-    --// internals (no UI: they are not worth a slider)
+    --// internals
     Dwell = 2,               -- seconds flying through one titan before moving on
     PassSpeed = 240,         -- studs/s held THROUGH the nape. A captured manual kill
                              -- peaked at ~247 studs/s, so we match the real thing
@@ -441,9 +443,6 @@ local Farm = {
                              -- measured to land damage). "still" -> stand on the
                              -- nape and swing: measured 0 damage, debug only
     peakSpeed = 0,           -- peak blade speed seen on the last pass (studs/s)
-    UseSynthClick = false,   -- OFF: never synthesize mouse input. Turning this on
-                             -- makes the client click at screen centre for you,
-                             -- which steals the cursor while the menu is open
     state = "IDLE",
     reloadCooldownUntil = 0,
     lastHop = -1e6,            -- throttle for cross-place teleports
@@ -451,7 +450,6 @@ local Farm = {
     killFloorAt = 0,           -- os.clock() of the last killfloor scan
     sawAOT = false,            -- latch: once we spot AOT content, never hop out
     sawTitans = false,         -- latch: we have fought in THIS server
-    resumeAfterHop = true,     -- re-arm the farm after OUR OWN server hop
     flagAt = 0,                -- last refresh of the resume marker
     kills = 0,
 }
@@ -807,16 +805,18 @@ local function patchAttackSpeed(on)
     return true
 end
 
---// v3.5: swinging NO LONGER TOUCHES YOUR MOUSE. Until now every swing fired
---// SendMouseMoveEvent + a click at screen centre, which hijacked the real cursor
---// and clicked whatever sat under it — that is what made the menu unusable while
---// the farm ran. The game's own action ("Slash", from Storage.Actions.Computer)
---// is the honest swing and touches nothing of yours; synthesized clicks exist
---// only behind "Click for me", which is OFF by default.
+--// v3.5: swinging NO LONGER TOUCHES YOUR MOUSE (that is what made the menu
+--// unusable: every swing moved the real cursor and clicked at screen centre).
+--// The game's own action ("Slash", from Storage.Actions.Computer) is the honest
+--// swing and uses nothing of yours.
 local function swing()
     action("Slash", true)
     task.delay(0.03, function() action("Slash", false) end)
-    if Farm.UseSynthClick and not typing() then
+    --// synthesized clicks exist ONLY as a fallback for a build with no action
+    --// API at all — it is automatic, there is no switch, and on a normal client
+    --// it never runs, so your mouse is never touched
+    local needsClick = not (type(InputModule) == "table" and type(InputModule.Action) == "function")
+    if needsClick and not typing() then
         local cam = workspace.CurrentCamera
         local vp = (cam and cam.ViewportSize) or Vector2.new(800, 600)
         local cx, cy = vp.X / 2, vp.Y / 2
@@ -1203,33 +1203,40 @@ local function reloadBlades(reason)
     return true
 end
 
---// runs even with the farm off, so your blades never sit broken
+--// ALWAYS on, farm or not: a broken blade deals no damage, so this is not an
+--// option you should have to find in a menu
 task.spawn(function()
     while true do
         task.wait(0.5)
-        if AutoReload.Enabled or Farm.Enabled then
-            local have, max = bladeStats()
-            --// ANY missing set counts, not just "down to 1": that was why a
-            --// half-broken blade set sat there dealing no damage
-            if have and max and have < max then
-                AutoReload.failingSince = AutoReload.failingSince or os.clock()
-                --// it keeps not taking -> stand still for a second and retry:
-                --// flying through titans mid-reload can cancel the reload, and
-                --// then we swing on broken blades forever
-                if os.clock() - AutoReload.failingSince > 4 then
-                    AutoReload.failingSince = nil
-                    AutoReload.pauseUntil = os.clock() + 1.2
-                    AutoReload.cooldown = 0
-                    if Debug then Debug:Log("[Reload] still broken after 4s - pausing the pass to reload") end
-                end
-                reloadBlades(("sets=%d/%d"):format(have, max))
-            else
+        local have, max = bladeStats()
+        --// ANY missing set counts, not just "down to 1": that was why a
+        --// half-broken blade set sat there dealing no damage
+        if have and max and have < max then
+            AutoReload.failingSince = AutoReload.failingSince or os.clock()
+            --// it keeps not taking -> stand still for a second and retry: flying
+            --// through titans mid-reload can cancel the reload, and then we
+            --// swing on broken blades forever
+            if os.clock() - AutoReload.failingSince > 4 then
                 AutoReload.failingSince = nil
-                AutoReload.pauseUntil = nil
+                AutoReload.pauseUntil = os.clock() + 1.2
+                AutoReload.cooldown = 0
+                if Debug then Debug:Log("[Reload] still broken after 4s - pausing the pass to reload") end
             end
+            reloadBlades(("sets=%d/%d"):format(have, max))
+        else
+            AutoReload.failingSince = nil
+            AutoReload.pauseUntil = nil
         end
     end
 end)
+
+--// the reload is reachable without a button:  HamasAOT_Reload()
+getgenv().HamasAOT_Reload = function()
+    AutoReload.cooldown = 0
+    local ok = reloadBlades("console")
+    local have, max = bladeStats()
+    return string.format("reload=%s bladeHUD=%s", tostring(ok), have and (have .. "/" .. max) or "?")
+end
 
 local function needReload()
     if os.clock() < Farm.reloadCooldownUntil then return nil end
@@ -1276,13 +1283,10 @@ task.spawn(function()
                 if not (game:IsLoaded() and isAOTPlace()) then
                     task.wait(2.5)
                     if not isAOTPlace() then
-                        if Farm.AutoTeleport then
-                            Farm.state = "HOP_LOBBY"
-                            hopToPlace(LOBBY_PLACE_ID, "not in AOT (place " .. tostring(game.PlaceId) .. ")")
-                            task.wait(6)
-                            continue
-                        end
-                        --// teleport is off -> sit still and touch nothing
+                        --// not AOT and never seen AOT this session -> sit still and
+                        --// touch nothing. The farm only ever moves you WITHIN AOT
+                        --// (lobby -> mission, mission -> mission), so it can never
+                        --// yank you out of an unrelated game.
                         Farm.state = "WAITING"
                         if Debug and not Farm.warnedPlace then
                             Farm.warnedPlace = true
@@ -1366,6 +1370,9 @@ end)
 local function setFarm(v)
     Farm.Enabled = v and true or false
     setFarmFlag(Farm.Enabled)
+    --// the gear's swing-timing patch rides along with the one switch (it used to
+    --// be a second toggle: hits now land on frame 1 whenever the farm is on)
+    pcall(patchAttackSpeed, Farm.Enabled)
     if Farm.Enabled then
         local ch = LocalPlayer.Character
         local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
@@ -1415,7 +1422,8 @@ getgenv().HamasAOT_FarmStatus = function()
             local have, max = bladeStats()
             return have and (have .. "/" .. max) or nil
         end)(),
-        synthClick = Farm.UseSynthClick,
+        inputMode = (type(InputModule) == "table" and type(InputModule.Action) == "function")
+            and "game-action" or "synth-click-fallback",
         mode = Farm.Mode, passSpeed = Farm.PassSpeed,
         lastPeakBladeSpeed = math.floor(Sweep.peak or 0), bestBladeSpeed = math.floor(Farm.peakSpeed or 0),
         passes = Sweep.passes, driver = Sweep.driver and true or false,
@@ -1433,26 +1441,10 @@ end
 --// UI
 --// ===========================================================================
 local F = Tabs.Farming
-F:CreateSection("Auto Farm (Missions)")
+F:CreateSection("Auto Farm")
 local FarmToggle = F:CreateToggle("AOT_FarmMaster", { Title = "Auto Farm",
-    Description = "Flies you through titan napes fast enough to cut them, swinging the whole way, then retries the mission",
+    Description = "One switch for the lot: cuts every titan's nape, reloads your blades, hides you under the map when there is nothing to fight or you get low, and retries the next mission. It never touches your mouse, and it never leaves an AOT place.",
     Default = false, Callback = setFarm })
-F:CreateToggle("AOT_FarmAutoTP", { Title = "Auto-teleport me into AOT", Default = false,
-    Description = "Off = the farm never moves you between games; it only farms where you already are",
-    Callback = function(v) Farm.AutoTeleport = v end })
-F:CreateSlider("AOT_FarmSwing", { Title = "Swing interval (s)", Description = "Lower = more swings per pass", Default = 0.12, Min = 0.05, Max = 0.6, Rounding = 2,
-    Callback = function(v) Farm.SwingDelay = v end })
-F:CreateSlider("AOT_FarmPass", { Title = "Pass speed (studs/s)", Default = 240, Min = 60, Max = 520, Rounding = 0,
-    Description = "How fast you cross the nape. Real killing swings run ~247 — too slow deals nothing, and the farm raises this on its own if kills stall",
-    Callback = function(v) Farm.PassSpeed = v end })
-F:CreateSlider("AOT_FarmRetreat", { Title = "Hide under map below HP %", Default = 30, Min = 0, Max = 80, Rounding = 0,
-    Description = "Dives under the map to shake off a grab, then comes back out",
-    Callback = function(v) Farm.RetreatHP = v end })
-F:CreateSlider("AOT_FarmGas", { Title = "Refill below gas %", Default = 15, Min = 5, Max = 50, Rounding = 0,
-    Callback = function(v) Farm.GasThreshold = v end })
-F:CreateToggle("AOT_FarmResume", { Title = "Resume after server hop", Default = true,
-    Description = "Switches Auto Farm back on after the farm itself hops servers",
-    Callback = function(v) Farm.resumeAfterHop = v end })
 
 local C = Tabs.Combat
 C:CreateSection("Nape Hitbox")
@@ -1468,31 +1460,6 @@ C:CreateToggle("AOT_Stream", { Title = "Streamer Mode (invisible hitbox)", Defau
         Nape.Streamer = v
         if Nape.Enabled then napeRefreshAll() end
         Fluent:Notify({ Title = "HamasClient", Content = v and "Streamer mode ON" or "Streamer mode OFF", Duration = 2 })
-    end })
-
-C:CreateSection("Attack speed")
-C:CreateToggle("AOT_InstantHits", { Title = "Instant blade hits",
-    Description = "Patches the gear's swing timing table (M1_Frames) so hits land on frame 1",
-    Default = false, Callback = patchAttackSpeed })
-C:CreateToggle("AOT_SynthClick", { Title = "Click for me (uses your mouse)",
-    Description = "OFF: the farm drives the game's own Slash action and never touches your mouse, so the menu stays usable. ON: it also clicks at screen centre, which can fight your cursor",
-    Default = false, Callback = function(v) Farm.UseSynthClick = v end })
-
-C:CreateSection("Blades")
-C:CreateToggle("AOT_AutoReload", { Title = "Auto reload blades",
-    Description = "Blades break after a few cuts, and a broken blade deals no damage — reloads the moment a set is missing",
-    Default = true, Callback = function(v) AutoReload.Enabled = v end })
-C:CreateButton({ Title = "Reload blades now",
-    Description = "Fires a reload immediately and tells you what the blade HUD actually reads",
-    Callback = function()
-        local have, max = bladeStats()
-        AutoReload.cooldown = 0
-        local ok = reloadBlades("manual")
-        Fluent:Notify({ Title = "HamasClient",
-            Content = ("Reload fired (%s) — blade HUD: %s"):format(
-                ok and "held R + game action" or "skipped, cooldown",
-                have and (have .. " / " .. max) or "not found"),
-            Duration = 3 })
     end })
 
 C:CreateSection("Anti-Eat")
@@ -1558,7 +1525,6 @@ end
 --// post-hop resume — only through the real toggle, only for a fresh marker
 --// ===========================================================================
 local function tryResume(attempt)
-    if not Farm.resumeAfterHop then return end
     if not farmFlagAge() then return end -- stale/none = stay OFF
     if not (game:IsLoaded() and isAOTPlace()) then
         if attempt < 6 then task.delay(2, function() tryResume(attempt + 1) end) end
@@ -1569,4 +1535,4 @@ local function tryResume(attempt)
 end
 tryResume(1)
 
-print("[Hamas] AOT Revolution v3.5 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.6 loaded, place:", game.PlaceId)
