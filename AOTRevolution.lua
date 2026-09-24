@@ -6,6 +6,19 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.17: two bugs in v3.16, both mine, both caught by one log line.
+--//        (1) Modules came back nil ("modules from: none | Input.Action: false
+--//        | Input.Slash: false | ODMG.M1: false"). Cause: the path walk used
+--//        gmatch("[^.]++"), and Lua patterns have no possessive quantifier, so
+--//        the pattern was malformed, gmatch threw, and my pcall swallowed it. The
+--//        host lookup was right all along; the walk never ran.
+--//        (2) The triggerbot was still firing action("Slash", true) — the entry
+--//        proven to be a no-op — instead of the host-aware swing, so even with the
+--//        modules fixed it would have swung at nothing.
+--//        Every swing entry is now a PRESS/RELEASE PAIR and always releases. A
+--//        press without a release leaves the gear holding the button, and a gear
+--//        holding the button accepts no swings at all — not ours, and not yours.
+--//        That is also why releaseSwing() runs whenever the farm stops.
 --// v3.16: THE HOST, and the durability oracle. The swing probe's errors showed
 --//        every gear function indexes its FIRST ARGUMENT for .Modules — so it
 --//        wants char.Actor.Client.Host, and it wants the module copy that lives
@@ -1146,19 +1159,34 @@ local function gameModule(path)
     local got
     local host = gameHost()
     if host then
-        pcall(function()
+        --// keep the ERROR, not just the failure: a swallowed pcall is exactly how
+        --// v3.16 shipped with every module nil and no clue why
+        local ok, err = pcall(function()
             local node = host.Modules
-            for part in path:gmatch("[^.]++") do node = node[part] end
+            for part in path:gmatch("[^.]+") do
+                node = node[part]
+                if not node then error("missing " .. part, 2) end
+            end
             got = require(node)
         end)
         if type(got) == "table" then GameEnv.src = "host" return got end
+        GameEnv.err = ("%s -> %s"):format(path, ok and "require returned " .. type(got) or tostring(err))
     end
-    pcall(function()
+    local ok2, err2 = pcall(function()
         local node = ReplicatedStorage.Modules
-        for part in path:gmatch("[^.]++") do node = node[part] end
+        for part in path:gmatch("[^.]+") do
+            node = node[part]
+            if not node then error("missing " .. part, 2) end
+        end
         got = require(node)
     end)
-    if type(got) == "table" then GameEnv.src = "replicated-fallback" end
+    if type(got) == "table" then
+        GameEnv.src = "replicated-fallback"
+        return got
+    end
+    if not GameEnv.err then
+        GameEnv.err = ("%s -> %s"):format(path, ok2 and "require returned " .. type(got) or tostring(err2))
+    end
     return got
 end
 
@@ -1178,6 +1206,7 @@ local function refreshModules()
     if Debug and not GameEnv.reported then
         GameEnv.reported = true
         Debug:Log("[Swing] modules from:", GameEnv.src,
+            GameEnv.err and ("| error: " .. GameEnv.err) or "",
             "| host:", host and host:GetFullName() or "NOT FOUND",
             "| Input.Action:", tostring(type(InputModule) == "table" and type(InputModule.Action) == "function"),
             "| Input.Slash:", tostring(type(InputModule) == "table" and type(InputModule.Slash) == "function"),
@@ -1226,26 +1255,44 @@ local function patchAttackSpeed(on)
     return true
 end
 
---// THE SWING, host-aware. The probe proved Input.Action(name, pressed) is a silent
---// no-op — 205 fires, zero swings — and the error messages showed why: these
---// functions want the HOST as argument one. So we try the real entries with the
---// host first and stop at the first one that does not throw. Your mouse is never
---// touched: no synthesized click anywhere on this path.
-local Swing = { logAt = 0, winner = nil }
-local SWING_ORDER = { "ODMG.M1(host)", "Input.Slash(host)", "Input.Action(host,name,true)", "Input.Action(host,true)" }
+--// THE SWING, host-aware, and every shape is a PRESS/RELEASE PAIR.
+--//
+--// Two things are load-bearing here. First, the HOST must be argument one (that is
+--// what the probe's errors said: each function indexes arg1 for .Modules). Second,
+--// a press WITHOUT a release leaves the gear holding the button — and while it is
+--// held it will not accept another swing, not from us and not from YOU either. So
+--// the release is not optional bookkeeping, it is why manual swinging kept working.
+local Swing = { logAt = 0, winner = nil, held = false, heldShape = nil }
+local SWING_ORDER = { "ODMG.M1", "Input.Slash", "Input.Action" }
 
-local function swingShape(shape, host)
+--// returns a function(pressed) for this entry, or nil when it is not available
+local function swingPair(shape, host)
     local M, O = InputModule, ODMGModule
-    if shape == "ODMG.M1(host)" and type(O) == "table" and type(O.M1) == "function" then
-        return pcall(O.M1, host)
-    elseif shape == "Input.Slash(host)" and type(M) == "table" and type(M.Slash) == "function" then
-        return pcall(M.Slash, host)
-    elseif shape == "Input.Action(host,name,true)" and type(M) == "table" and type(M.Action) == "function" then
-        return pcall(M.Action, host, "Slash", true)
-    elseif shape == "Input.Action(host,true)" and type(M) == "table" and type(M.Action) == "function" then
-        return pcall(M.Action, host, true)
+    if not host then return nil end
+    if shape == "ODMG.M1" and type(O) == "table" and type(O.M1) == "function" then
+        return function(p) return pcall(O.M1, host, p) end
+    elseif shape == "Input.Slash" and type(M) == "table" and type(M.Slash) == "function" then
+        return function(p) return pcall(M.Slash, host, p) end
+    elseif shape == "Input.Action" and type(M) == "table" and type(M.Action) == "function" then
+        return function(p) return pcall(M.Action, host, "Slash", p) end
     end
-    return false, "not available"
+    return nil
+end
+
+--// ALWAYS call this when the farm stops, or after a failed swing: a gear stuck
+--// holding the button is a gear that will not swing again.
+local function releaseSwing()
+    if not Swing.held then return end
+    Swing.held = false
+    local host = gameHost()
+    local pair = host and swingPair(Swing.heldShape, host)
+    if pair then pcall(pair, false) end
+    --// and a bare mouse-up, in case anything on the engine side latched it
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        local vp = (cam and cam.ViewportSize) or Vector2.new(800, 600)
+        VIM:SendMouseButtonEvent(math.floor(vp.X / 2), math.floor(vp.Y / 2), 0, false, game, 0)
+    end)
 end
 
 local function swing()
@@ -1258,26 +1305,30 @@ local function swing()
         end
         return false
     end
-    --// once one entry has proven clean we lead with it, but we still fall through
-    --// the others if it ever starts throwing
-    local order = SWING_ORDER
-    if Swing.winner then
-        order = { Swing.winner }
-        for _, s in ipairs(SWING_ORDER) do
-            if s ~= Swing.winner then order[#order + 1] = s end
-        end
+    --// release the previous press first, so no shape can ever be left held
+    if Swing.held then releaseSwing() end
+
+    local order = {}
+    if Swing.winner then order[#order + 1] = Swing.winner end
+    for _, s in ipairs(SWING_ORDER) do
+        if s ~= Swing.winner then order[#order + 1] = s end
     end
     for _, shape in ipairs(order) do
-        local ok, err = swingShape(shape, host)
-        if ok then
-            if Swing.winner ~= shape then
-                Swing.winner = shape
-                if Debug then Debug:Log("[Swing] using", shape) end
+        local pair = swingPair(shape, host)
+        if pair then
+            local ok, err = pair(true)
+            if ok then
+                if Swing.winner ~= shape then
+                    Swing.winner = shape
+                    if Debug then Debug:Log("[Swing] using", shape, "(host-first)") end
+                end
+                Swing.held = true
+                Swing.heldShape = shape
+                return true
+            elseif Debug and (os.clock() - Swing.logAt) > 5 then
+                Swing.logAt = os.clock()
+                Debug:Log("[Swing]", shape, "->", tostring(err))
             end
-            return true
-        elseif Debug and (os.clock() - Swing.logAt) > 5 then
-            Swing.logAt = os.clock()
-            Debug:Log("[Swing]", shape, "->", tostring(err))
         end
     end
     return false
@@ -1587,17 +1638,8 @@ end
 
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if not (Farm.Enabled and Attack.active) then
-        if Trigger.held then
-            Trigger.held = false
-            action("Slash", false)
-        end
-        return
-    end
-    --// release on the very next frame: Holding must never stick, or the gear
-    --// stops accepting swings altogether
-    if Trigger.held then
-        action("Slash", false)
-        Trigger.held = false
+        --// never leave the gear holding the button when we stop
+        releaseSwing()
         return
     end
     local char = LocalPlayer.Character
@@ -1624,17 +1666,24 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     elseif not gearReady() then
         Trigger.heldBack = Trigger.heldBack + 1
     else
-        --// FIRE. This same frame, no delay, no queue.
-        action("Slash", true)
-        Trigger.held = true
-        Trigger.lastFire = os.clock()
-        Trigger.fires = Trigger.fires + 1
+        --// FIRE through the host-aware swing, which presses AND releases. This
+        --// used to call action("Slash", true) — the entry that is a proven no-op
+        --// (205 fires, zero swings), so the triggerbot was firing at nothing.
+        if swing() then
+            Trigger.lastFire = os.clock()
+            Trigger.fires = Trigger.fires + 1
+        else
+            Trigger.noSwing = (Trigger.noSwing or 0) + 1
+        end
     end
 
     if Debug and (os.clock() - Trigger.logAt) > 5 then
         Trigger.logAt = os.clock()
         Debug:Log(string.format("[Trigger] contacts %d | fired %d | over-window skips %d | gear busy %d | window %.2fs",
             Trigger.contacts, Trigger.fires, Trigger.skipped, Trigger.heldBack, Trigger.window))
+        if (Trigger.noSwing or 0) > 0 then
+            Debug:Log("[Trigger] could not swing", Trigger.noSwing, "times (no working entry?)")
+        end
     end
 end)
 
@@ -2288,18 +2337,23 @@ getgenv().HamasSwingTest = function()
         local h = t and t:FindFirstChildOfClass("Humanoid")
         return h and h.Health or nil
     end
+    refreshModules()
     local O, M, B = ODMGModule, InputModule, BladesModule
+    --// every swing candidate below carries a THIRD entry: the release. The test
+    --// always releases after each one, so it can never leave the gear holding the
+    --// button (which would block your own swings as well as ours).
     local cands = {
-        { "ODMG.M1(host)",            function() return O and O.M1(host) end },
-        { "ODMG.M1(host,true)",       function() return O and O.M1(host, true) end },
-        { "Input.Slash(host)",        function() return M and M.Slash(host) end },
-        { "Input.Slash(host,'Slash')",function() return M and M.Slash(host, "Slash") end },
-        { "Input.Slash(host,true)",   function() return M and M.Slash(host, true) end },
-        { "Input.Action(host,n,t)",   function() return M and M.Action(host, "Slash", true) end },
-        { "Input.Action(host,true)",  function() return M and M.Action(host, true) end },
-        { "Blades.Reload(host)",      function() return B and B.Reload(host) end },
-        { "ODMG.Reload(host)",        function() return O and O.Reload(host) end },
-        { "ODMG.Get_Reload(host)",    function() return O and O.Get_Reload(host) end },
+        { "ODMG.M1(host,true/false)",  function() return O and O.M1(host, true) end,
+          function() return O and O.M1(host, false) end },
+        { "Input.Slash(host,p)",       function() return M and M.Slash(host, true) end,
+          function() return M and M.Slash(host, false) end },
+        { "Input.Action(host,'Slash',p)", function() return M and M.Action(host, "Slash", true) end,
+          function() return M and M.Action(host, "Slash", false) end },
+        { "Input.Action(host,p)",      function() return M and M.Action(host, true) end,
+          function() return M and M.Action(host, false) end },
+        { "Blades.Reload(host)",       function() return B and B.Reload(host) end },
+        { "ODMG.Reload(host)",         function() return O and O.Reload(host) end },
+        { "ODMG.Get_Reload(host)",     function() return O and O.Get_Reload(host) end },
     }
     for _, c in ipairs(cands) do
         local h0 = titanHP()
@@ -2308,6 +2362,7 @@ getgenv().HamasSwingTest = function()
         task.wait(0.5)
         local h1 = titanHP()
         local seg1 = select(1, bladeSegments())
+        if c[3] then pcall(c[3]) end --// always release, whatever happened
         local line = ("%s -> %s"):format(c[1], ok and "clean" or ("ERR " .. tostring(err)))
         if h0 and h1 and h0 ~= h1 then line = line .. ("   *** TITAN HP %d -> %d"):format(h0, h1) end
         if seg1 ~= seg0 then line = line .. ("   blades %d -> %d"):format(seg0, seg1) end
@@ -2473,6 +2528,7 @@ local function setFarm(v)
         AutoReload.gaveUp = false
         ensureKillFloor(true)
     else
+        releaseSwing() -- never hand the game back a held button
         stopPark()
         stopAttack()
         Park.surface = nil
@@ -2645,6 +2701,7 @@ getgenv().HamasAOT_Shutdown = function()
     Speed.Enabled = false
     AntiEat.Enabled = false
     Farm.Enabled = false
+    releaseSwing()
     stopPark()
     stopAttack()
     pcall(function() RunService:UnbindFromRenderStep("HamasPark") end)
@@ -2679,7 +2736,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.16 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.17 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.16 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.17 loaded", Duration = 3 })
 end)
