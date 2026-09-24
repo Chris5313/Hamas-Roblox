@@ -180,6 +180,11 @@ local SaveManager = {} do
 		if not success then return false, "decode error" end
 
 		for _, option in next, decoded.objects do
+			--// ignored indexes are never LOADED either, not just never saved. Without
+			--// this an old config keeps re-applying them: a stale
+			--// "AOT_FarmMaster": false would switch the farm straight back off ~2s
+			--// after the script resumed it, which looks like the toggle flashing.
+			if self.Ignore[option.idx] then continue end
 			if self.Parser[option.type] then
 				task.spawn(self.Library.SafeCallback, self.Library, self.Parser[option.type].Load, option.idx, option)
 			end

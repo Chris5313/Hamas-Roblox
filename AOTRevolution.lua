@@ -6,6 +6,13 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.8: the farm no longer flashes on/off when you inject. Cause: the config
+--//        autoload (~2s after inject) re-applied a saved "AOT_FarmMaster: false",
+--//        so the resume switched the farm on and the config switched it straight
+--//        back off. SaveManager.Load now honours the ignore list (saving already
+--//        did), the resume runs after the autoload window and re-asserts itself
+--//        once, and arming on inject now needs a marker that ONLY a farm-caused
+--//        hop writes — a plain re-inject never turns the farm on by itself.
 --// v3.7: the under-map park, properly. Depth is measured from the GROUND UNDER
 --//        YOU (a downward raycast) instead of from the lowest anchored part in
 --//        the workspace — on a big map those are hundreds of studs apart, which
@@ -66,7 +73,7 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "3.7",
+    Version = "3.8",
     Debug = true,
     Tabs = {
         { Title = "Farming",  Icon = "wheat" },
@@ -472,8 +479,16 @@ local AOT_PLACES = {
 }
 
 local FARM_FLAG = "HamasAOT_FarmEnabled.txt"
+--// Separate marker for "the farm itself just moved you to another server". The
+--// farm-only flag is refreshed every 60s while a match runs, so on its own it
+--// cannot tell "I re-injected after a hop" apart from "I just re-injected" — and
+--// arming the farm on the second one is the surprise nobody wants. Only a hop the
+--// farm caused writes this one.
+local FARM_HOP_FLAG = "HamasAOT_FarmHop.txt"
 
 local FARM_FLAG_TTL = 120 -- seconds: only a hop WE just caused may re-arm the farm
+
+local HOP_FLAG_TTL = 150 -- a hop plus its server load and a re-inject has to fit
 
 local function setFarmFlag(v)
     pcall(function()
@@ -500,6 +515,25 @@ local function farmFlagAge()
     local age = os.time() - stamp
     if age < 0 or age > FARM_FLAG_TTL then
         pcall(function() delfile(FARM_FLAG) end)
+        return nil
+    end
+    return age
+end
+
+local function setHopFlag()
+    pcall(function() writefile(FARM_HOP_FLAG, tostring(os.time())) end)
+end
+
+local function hopFlagAge()
+    local ok, content = pcall(function()
+        if isfile(FARM_HOP_FLAG) then return readfile(FARM_HOP_FLAG) end
+        return nil
+    end)
+    if not ok or not content then return nil end
+    local stamp = tonumber(content:match("%-?%d+"))
+    local age = stamp and (os.time() - stamp) or nil
+    if not age or age < 0 or age > HOP_FLAG_TTL then
+        pcall(function() delfile(FARM_HOP_FLAG) end)
         return nil
     end
     return age
@@ -591,7 +625,10 @@ local function hopToPlace(placeId, reason, force)
     local now = os.clock()
     if not force and (now - (Farm.lastHop or 0)) < HOP_COOLDOWN then return false, "cooldown" end
     Farm.lastHop = now
-    if Farm.Enabled then setFarmFlag(true) end -- re-arm in the new server
+    if Farm.Enabled then
+        setFarmFlag(true) -- re-arm in the new server
+        setHopFlag()      -- ...but only because the FARM moved you there
+    end
     if Debug then Debug:Log("[Farm] TELEPORT ->", placeId, reason or "") end
     Fluent:Notify({ Title = "HamasClient", Content = "Teleporting to AOT (" .. placeId .. ")...", Duration = 3 })
     local ok, err = pcall(function()
@@ -1396,6 +1433,7 @@ task.spawn(function()
                     --// 2) in a mission: the proven retry click = hop to the next one
                     task.wait(1)
                     setFarmFlag(true) -- the marker must be fresh when the hop lands
+                    setHopFlag()      -- a farm-caused transition, same as a hop
                     ok, msg = clickRetry()
                     if not ok and Debug then Debug:Log("[Farm] retry:", msg) end
                     for _ = 1, 24 do
@@ -1624,14 +1662,29 @@ end
 --// post-hop resume — only through the real toggle, only for a fresh marker
 --// ===========================================================================
 local function tryResume(attempt)
-    if not farmFlagAge() then return end -- stale/none = stay OFF
+    --// both markers must be fresh: the farm was on, AND the farm is the one that
+    --// moved you here. A plain re-inject never arms the farm by itself.
+    if not (farmFlagAge() and hopFlagAge()) then return end
     if not (game:IsLoaded() and isAOTPlace()) then
         if attempt < 6 then task.delay(2, function() tryResume(attempt + 1) end) end
         return
     end
     if Debug then Debug:Log("[Farm] fresh resume marker — switching the Auto Farm toggle on") end
     pcall(function() FarmToggle:SetValue(true) end)
+    --// and make sure it STUCK. If anything switches it back off (a stale saved
+    --// config used to, every single inject) we take it back on once, then leave
+    --// it alone — switching it off by hand must still work.
+    task.delay(1.5, function()
+        if Farm.Enabled then return end
+        if not hopFlagAge() then return end -- marker gone = the user turned it off
+        if Debug then Debug:Log("[Farm] the resume did not stick — switching Auto Farm back on") end
+        pcall(function() FarmToggle:SetValue(true) end)
+    end)
 end
-tryResume(1)
 
-print("[Hamas] AOT Revolution v3.7 loaded, place:", game.PlaceId)
+--// Runs AFTER the config autoload window (base schedules it at 2s). Resuming
+--// before that is what made the farm flash on and off on inject: the toggle went
+--// on, then the saved config put it straight back to false.
+task.delay(3, function() tryResume(1) end)
+
+print("[Hamas] AOT Revolution v3.8 loaded, place:", game.PlaceId)
