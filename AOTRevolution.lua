@@ -6,6 +6,22 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.14: two bugs, both mine, both visible in one log.
+--//        (1) The triggerbot fired 676 swings in 45 seconds — about 15 a second —
+--//        while the gear's own Input.Frames = 15 says one swing per ~0.25s. Three
+--//        of every four swings were thrown away, and the accepted ones ground the
+--//        blade sets to nothing. The trigger is still instant on contact, but it
+--//        now refuses to fire inside the gear's own swing window, read live from
+--//        Input.Frames instead of hard-coded.
+--//        (2) My 4-second reload trigger burned all three blade sets in eight
+--//        seconds (2/3 -> 1/3 -> 0/3), and with no blades every later swing dealt
+--//        nothing by definition — that IS "my blades are just running out without
+--//        hitting". A reload costs a blade set and there is no readable
+--//        broken-blade signal, so auto reload is now: ten seconds of continuous
+--//        nape contact with zero kills, at most twice per session, never with an
+--//        empty reserve, and it stops and tells you instead of grinding your sets
+--//        away. getgenv().HamasBladeProbe() hunts for the durability oracle that
+--//        would make this precise.
 --// v3.13: auto-reload, corrected from the RE probe rather than guessed at.
 --//        The probe (AOT_Reload_RE.lua, blades fully broken, R pressed by hand)
 --//        showed the game does NOT reload through Blades.Reload / ODMG.Reload /
@@ -1322,8 +1338,26 @@ end)
 --// test has said nothing for 0.4s, so a blade naming change in a future update
 --// can never leave the farm standing there doing nothing.
 -- ===========================================================================
-local Trigger = { contacts = 0, fires = 0, heldBack = 0, lastFire = 0, lastContact = 0,
-                  held = false, blades = nil, bladesAt = 0, logAt = 0, lastNames = "" }
+local Trigger = { contacts = 0, fires = 0, heldBack = 0, skipped = 0, lastFire = 0,
+                  lastContact = 0, held = false, blades = nil, bladesAt = 0, logAt = 0,
+                  lastNames = "", window = 0.25 }
+
+--// THE SWING WINDOW. Input.Frames = 15 in the game's own module: one swing takes
+--// about fifteen frames. v3.13 fired on contact every other frame — 676 swings in
+--// 45 seconds, roughly 15 a second, four times faster than the gear can accept.
+--// Three of every four were discarded, and the accepted ones are exactly what
+--// ground the blade sets down. So the trigger is fast-timed (fire the instant the
+--// blade is in the nape) but rate-limited to the gear's OWN swing window, read live
+--// from the module rather than hard-coded.
+local function swingWindow()
+    if type(InputModule) == "table" then
+        local ok, f = pcall(function() return InputModule.Frames end)
+        if ok and type(f) == "number" and f >= 1 then
+            return math.clamp(f / 60, 0.1, 1.2)
+        end
+    end
+    return 0.25
+end
 
 --// the blades live on the character and the capture names them Main / Copy /
 --// Hitbox (Hitbox is the one with CanTouch true). Cache the list; re-scan once
@@ -1422,11 +1456,24 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not (char and hum and hum.Health > 0) then return end
 
+    --// re-read the gear's swing window every couple of seconds (it is the game's
+    --// table, not ours, so do not assume it never changes)
+    if os.clock() > (Trigger.windowAt or 0) then
+        Trigger.windowAt = os.clock() + 2
+        Trigger.window = swingWindow()
+    end
+
     local blade = napeContact(char)
     if not blade then return end
     Trigger.contacts = Trigger.contacts + 1
     Trigger.lastContact = os.clock()
-    if not gearReady() then
+
+    --// the gear's own swing window: firing faster than it can accept is what
+    --// ground the blade sets away in v3.13. Contact is still detected instantly;
+    --// we just refuse to fire the swing the gear is still recovering from.
+    if (os.clock() - Trigger.lastFire) < Trigger.window then
+        Trigger.skipped = Trigger.skipped + 1
+    elseif not gearReady() then
         Trigger.heldBack = Trigger.heldBack + 1
     else
         --// FIRE. This same frame, no delay, no queue.
@@ -1438,8 +1485,8 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
 
     if Debug and (os.clock() - Trigger.logAt) > 5 then
         Trigger.logAt = os.clock()
-        Debug:Log("[Trigger] contacts", Trigger.contacts, "| fired", Trigger.fires,
-            "| held back (gear busy)", Trigger.heldBack)
+        Debug:Log(string.format("[Trigger] contacts %d | fired %d | over-window skips %d | gear busy %d | window %.2fs",
+            Trigger.contacts, Trigger.fires, Trigger.skipped, Trigger.heldBack, Trigger.window))
     end
 end)
 
@@ -1907,55 +1954,52 @@ task.spawn(function()
     while true do
         task.wait(0.5)
         local have, max = bladeStats()
-        --// v3.13 — THE REAL TRIGGER, corrected from the probe.
-        --// The "n / m" label is the blade RESERVE, and your own capture shows it
-        --// reading 3/3 with the blades FULLY BROKEN — so anything keyed off it can
-        --// never fire while you still have reserve sets, which is why auto-reload
-        --// sat there doing nothing. There is no readable durability number
-        --// anywhere (Get_Reload() is nil, no numeric field changes), so a broken
-        --// blade is detected by its EFFECT from here:
-        --//   the triggerbot is IN CONTACT with a nape, swings are going out, and
-        --//   nothing is dying. That is what a broken blade looks like.
-        if have and max and have <= 0 then
-            reloadBlades("reserve empty")
-        end
-        if Farm.Enabled and (have or 0) > 0 and Attack.active then
+        --// AUTO RELOAD — deliberately timid, because a reload COSTS A BLADE SET.
+        --// The probe proved there is no readable broken-blade signal anywhere:
+        --// no numeric field on Blades/ODMG changes, Get_Reload() is nil, our hooks
+        --// never fire, and the [Blade] lines show the blade parts are byte-identical
+        --// broken or healthy (same Size, Transparency, CanTouch). So an automatic
+        --// reload is a guess that spends one of your three sets — and v3.13 fired
+        --// on a 4-second stall, which burned all three of yours in eight seconds
+        --// and left you with NO blades, which by itself guarantees zero damage.
+        --// The bar is much higher now:
+        --//   * TEN SECONDS of continuous nape contact with zero kills (unambiguous),
+        --//   * at most once every 20s and at most TWICE per farm session,
+        --//   * never when the reserve is empty (reloading cannot help then),
+        --//   * and it stops and says so rather than grinding your sets away.
+        if AutoReload.gaveUp then
+            --// already stopped and already said why: stay off it
+        elseif Farm.Enabled and (have or 0) > 0 and Attack.active
+            and (os.clock() - (Trigger.lastContact or 0)) < 1.0 then
             if Farm.kills ~= (AutoReload.killsAtCheck or -1) then
                 AutoReload.killsAtCheck = Farm.kills
                 AutoReload.stallSince = nil
-                AutoReload.fruitless = 0
-                AutoReload.gaveUp = false
-            elseif (os.clock() - (Trigger.lastContact or 0)) < 1.5 then
-                --// we are touching a nape right now and swinging at it
+                AutoReload.autoTries = 0
+            else
                 AutoReload.stallSince = AutoReload.stallSince or os.clock()
-                if os.clock() - AutoReload.stallSince > 4 then
+                if os.clock() - AutoReload.stallSince > 10 then
                     AutoReload.stallSince = os.clock()
-                    if (AutoReload.fruitless or 0) >= 3 then
-                        --// three reloads and still nothing dying: the blade is NOT
-                        --// the reason. Stop grinding the reserve down and say so.
-                        if not AutoReload.gaveUp then
-                            AutoReload.gaveUp = true
-                            AutoReload.quietUntil = os.clock() + 300
-                            if Debug then
-                                Debug:Log("[Reload] 3 reloads changed nothing — the blade is not why nothing dies")
-                            end
-                            pcall(function()
-                                Fluent:Notify({ Title = "HamasClient",
-                                    Content = "Reloads are not helping — blades are not why nothing is dying",
-                                    Duration = 5 })
-                            end)
-                        end
-                    else
-                        AutoReload.fruitless = (AutoReload.fruitless or 0) + 1
+                    if (AutoReload.autoTries or 0) >= 2 then
+                        AutoReload.gaveUp = true
+                        AutoReload.quietUntil = os.clock() + 600
                         if Debug then
-                            Debug:Log("[Reload] in contact + swinging + nothing dying -> reload",
-                                AutoReload.fruitless)
+                            Debug:Log("[Reload] 2 auto reloads changed nothing — stopping auto reload",
+                                "(blades are not why nothing dies)")
                         end
-                        reloadBlades("contact, no kills")
+                        pcall(function()
+                            Fluent:Notify({ Title = "HamasClient",
+                                Content = "Auto reload stopped — 2 reloads changed nothing, so blades are not the problem",
+                                Duration = 6 })
+                        end)
+                    else
+                        AutoReload.autoTries = (AutoReload.autoTries or 0) + 1
+                        AutoReload.cooldown = os.clock() + 20
+                        if Debug then
+                            Debug:Log("[Reload] 10s of nape contact, zero kills -> attempt", AutoReload.autoTries)
+                        end
+                        reloadBlades("10s contact, no kills")
                     end
                 end
-            else
-                AutoReload.stallSince = nil
             end
         else
             AutoReload.stallSince = nil
@@ -1968,7 +2012,57 @@ getgenv().HamasAOT_Reload = function()
     AutoReload.cooldown = 0
     local ok = reloadBlades("console")
     local have, max = bladeStats()
-    return string.format("reload=%s bladeHUD=%s", tostring(ok), have and (have .. "/" .. max) or "?")
+    return string.format("reload=%s reserve=%s", tostring(ok), have and (have .. "/" .. max) or "?")
+end
+
+--// FINDING THE DURABILITY ORACLE — opt-in, because nothing here is safe to guess
+--// at unattended. Blades.Check_Durability (arity 8) is the only entry on the blade
+--// path that sounds read-only and might RETURN the number we need; ODMG.Blade_Check
+--// (arity 3) is its counterpart. Calling a bytecode function with invented
+--// arguments can do nothing, error, or have a side effect, so this only runs when
+--// you ask for it:
+--//     getgenv().HamasBladeProbe()
+--// Run it once with blades BROKEN and once with blades HEALTHY and send both
+--// results. That difference is the oracle that turns auto-reload from a blind
+--// guess that costs a blade set into a precise, instant trigger.
+getgenv().HamasBladeProbe = function()
+    local out = {}
+    local Blades, ODMG
+    pcall(function() Blades = require(ReplicatedStorage.Modules.Utilities.Blades) end)
+    pcall(function() ODMG = require(ReplicatedStorage.Modules.Core.ODMG) end)
+    --// only the two "check" entries: they read, they do not change state. Anything
+    --// that sounds like it mutates (Reload/Drop/Break_Segment) is left alone here
+    --// on purpose — poking those with invented arguments could cost you blades.
+    local targets = {
+        { "Blades.Check_Durability", Blades, "Check_Durability" },
+        { "ODMG.Blade_Check",        ODMG,   "Blade_Check" },
+    }
+    for _, t in ipairs(targets) do
+        local label, tbl, key = t[1], t[2], t[3]
+        if type(tbl) ~= "table" or type(tbl[key]) ~= "function" then
+            out[#out + 1] = label .. " = unavailable"
+        else
+            local got = false
+            for n = 0, 8 do
+                local args = {}
+                for i = 1, n do args[i] = (i == 1 and LocalPlayer) or n end
+                local ok, res = pcall(function() return tbl[key](table.unpack(args)) end)
+                if ok then
+                    out[#out + 1] = ("%s(%d) -> %s"):format(label, n, tostring(res))
+                    got = true
+                    break
+                elseif n == 8 then
+                    out[#out + 1] = ("%s -> last error: %s"):format(label, tostring(res))
+                end
+            end
+            if not got then
+                out[#out + 1] = label .. " -> no clean arity"
+            end
+        end
+    end
+    local line = table.concat(out, " | ")
+    if Debug then Debug:Log("[BladeProbe]", line) end
+    return line
 end
 
 local function needReload()
@@ -2119,7 +2213,7 @@ local function setFarm(v)
         Park.surface = nil
         AutoReload.stallSince = nil
         AutoReload.killsAtCheck = Farm.kills
-        AutoReload.fruitless = 0
+        AutoReload.autoTries = 0
         AutoReload.gaveUp = false
         ensureKillFloor(true)
     else
@@ -2329,7 +2423,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.13 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.14 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.13 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.14 loaded", Duration = 3 })
 end)
