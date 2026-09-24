@@ -301,7 +301,7 @@ end
 
 --// Robust distance-proof teleport: a single huge CFrame jump gets rejected or
 --// snapped back when you are far out, so walk the character there in steps and
---// verify the landing. Works from any distance in the map.
+--//    verify the landing. Works from any distance in the map.
 local function teleportTo(target, opts)
     opts = opts or {}
     local char = LocalPlayer.Character
@@ -397,10 +397,13 @@ local Farm = {
     AutoTeleport = false,    -- OFF: never move the player between games
     --// internals (no UI: they are not worth a slider)
     Dwell = 2,               -- seconds sweeping one titan before moving on
-    SweepReach = 26,         -- studs either side of the nape we fly through
-    SweepSpeed = 420,        -- studs/s the server sees while sweeping
+    SweepReach = 26,         -- max studs either side of the nape (auto-tightened)
+    SweepSpeed = 300,        -- studs/s ceiling while sweeping
+    SweepGain = 11,          -- how hard we steer toward the far side of the nape
     RetreatTime = 2,         -- seconds hiding under the map when hurt
     ParkDepth = 150,         -- studs BELOW the map's killfloor we park
+    Mode = "still",           -- "still" -> stand + swing, "sweep" -> fly through;
+                              -- the farm steps itself up if still swings do nothing
     state = "IDLE",
     reloadCooldownUntil = 0,
     lastHop = -1e6,            -- throttle for cross-place teleports
@@ -656,7 +659,45 @@ end
 --//
 --// Under the map is only where you wait (no titans, or hurt) — never where you
 --// fight.
+--// THE GAME'S OWN ACTION NAMES. Storage.Actions.Computer lists every real
+--// action the input module drives: "Slash", "Reload", "Hook", "Boost",
+--// "Skill_1".."Skill_5". Calling Input.Action("Slash") is the honest swing —
+--// we wasted a while calling Input.Action("M1"), which is not an action at all.
+local InputModule
+pcall(function() InputModule = require(ReplicatedStorage.Modules.Core.Input) end)
+
+local function action(name)
+    if type(InputModule) ~= "table" or type(InputModule.Action) ~= "function" then return false end
+    return pcall(function() InputModule.Action(name) end)
+end
+
+--// ATTACK SPEED lives in ODMG.M1_Frames: every swing type has its hit frame,
+--// e.g. Air_Hit_1 = {11, 30} (hit on frame 11, 30-frame window). Pulling the
+--// first number down to 1 makes every swing connect on its first frame — the
+--// game's own timing table, patched, instead of faking inputs faster.
+local M1Orig = {}
+local function patchAttackSpeed(on)
+    local ODMG
+    if not pcall(function() ODMG = require(ReplicatedStorage.Modules.Core.ODMG) end) then return false end
+    if type(ODMG) ~= "table" or type(ODMG.M1_Frames) ~= "table" then return false end
+    local n = 0
+    for k, tbl in pairs(ODMG.M1_Frames) do
+        if type(tbl) == "table" and type(tbl[1]) == "number" then
+            if on then
+                M1Orig[k] = M1Orig[k] or tbl[1]
+                tbl[1] = 1
+            elseif M1Orig[k] then
+                tbl[1] = M1Orig[k]
+            end
+            n = n + 1
+        end
+    end
+    if Debug then Debug:Log("[Attack] M1_Frames", on and "patched" or "restored", n) end
+    return true
+end
+
 local function swing()
+    action("Slash") -- the game's own swing
     local cam = workspace.CurrentCamera
     local vp = (cam and cam.ViewportSize) or Vector2.new(800, 600)
     local cx, cy = vp.X / 2, vp.Y / 2
@@ -676,12 +717,33 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if not (hum and hrp and np and np.Parent and hum.Health > 0) then return end
 
     local center = np.Position
-    local goal = center + Sweep.axis * (Farm.SweepReach * Sweep.side)
+    local reach = math.max(8, math.min(Farm.SweepReach, (math.max(np.Size.X, np.Size.Z) * 0.5) + 6))
+    local target = center + Sweep.axis * (reach * Sweep.side)
     hrp.Anchored = false
-    hrp.CFrame = CFrame.new(goal)
-    hrp.AssemblyLinearVelocity = Sweep.axis * (Farm.SweepSpeed * Sweep.side)
-    hrp.AssemblyAngularVelocity = Vector3.zero
-    Sweep.side = -Sweep.side
+
+    if Sweep.hard then
+        --// the engine refuses to keep our velocity (the game's own ODM physics
+        --// re-writes it) -> fall back to steering by position
+        hrp.CFrame = CFrame.new(target)
+        Sweep.side = -Sweep.side
+    else
+        --// smooth: steer with velocity so the camera does not shake and the
+        --// server sees honest fast movement through the hitbox
+        local delta = target - hrp.Position
+        if delta.Magnitude < 3 then Sweep.side = -Sweep.side end
+        local vel = delta * Farm.SweepGain
+        if vel.Magnitude > Farm.SweepSpeed then vel = vel.Unit * Farm.SweepSpeed end
+        hrp.AssemblyLinearVelocity = vel
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        --// if we are not actually covering ground, switch to hard steering
+        Sweep.checkAt = Sweep.checkAt or (os.clock() + 0.4)
+        Sweep.checkFrom = Sweep.checkFrom or hrp.Position
+        if os.clock() > Sweep.checkAt then
+            if (hrp.Position - Sweep.checkFrom).Magnitude < 6 then Sweep.hard = true end
+            Sweep.checkAt = nil
+            Sweep.checkFrom = nil
+        end
+    end
 
     --// free touch pair every pass (helps on builds that accept synthesized touches)
     local hb = char:FindFirstChild("Hitbox")
@@ -692,10 +754,6 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
         end)
     end
 
-    --// swing on a timer, not every pass, so the clicks stay believable
-    Sweep.frame = Sweep.frame + 1
-    local every = math.max(1, math.floor(Farm.SwingDelay * 60))
-    if Sweep.frame % every == 0 then swing() end
 end)
 
 --// fly through one titan's nape until it dies (or Dwell expires)
@@ -708,13 +766,30 @@ local function sweepTitan(titan, seconds)
     --// the lane is the line we came in on, levelled out: < --- titan --- >
     local flat = (np.Position - hrp.Position) * Vector3.new(1, 0, 1)
     Sweep.axis = (flat.Magnitude > 3) and flat.Unit or Vector3.new(1, 0, 0)
+    --// get to the lane first (any distance), then sweep
+    if (np.Position - hrp.Position).Magnitude > 40 then
+        teleportTo(np.Position - Sweep.axis * 10)
+    end
     Sweep.titan = titan
     Sweep.side = 1
     Sweep.frame = 0
-    Sweep.active = true
+    Sweep.hard = false
+    Sweep.checkAt = nil
+    Sweep.checkFrom = nil
+    Sweep.active = (Farm.Mode ~= "still")
     local t0 = os.clock()
     while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
         if not (np.Parent and hum.Health > 0) then break end
+        if Farm.Mode == "still" then
+            --// "still" mode: sit exactly on the nape and just swing. No movement
+            --// at all — this works if the server only cares about the swing.
+            local cur = napeOf(titan) or np
+            if cur.Parent then
+                hrp.Anchored = false
+                hrp.CFrame = CFrame.new(cur.Position)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
         task.wait(0.05)
     end
     Sweep.active = false
@@ -743,9 +818,27 @@ local function killSweep()
     ensureKillFloor()
     Attack.active = true
 
+    --// swings run on their own thread, so a slow click never stalls movement
+    task.spawn(function()
+        while Attack.active and Farm.Enabled do
+            swing()
+            task.wait(Farm.SwingDelay)
+        end
+    end)
+
+    local modeStart, killsAtStart = os.clock(), Farm.kills
     while Attack.active and Farm.Enabled do
         local alive = liveTitans()
         if #alive == 0 then break end
+
+        --// SMART LADDER: start with the least invasive method (stand on the nape
+        --// and swing — no movement, no shaking). If nothing dies from that, step
+        --// up to sweeping through the hitbox at speed.
+        if Farm.Mode == "still" and (os.clock() - modeStart) > 7 and Farm.kills <= killsAtStart then
+            Farm.Mode = "sweep"
+            if Debug then Debug:Log("[Farm] still swings land nothing — switching to sweep") end
+            Fluent:Notify({ Title = "HamasClient", Content = "Still swings deal no damage — using the fast sweep", Duration = 3 })
+        end
 
         --// hurt -> dive under the map until the grab is off you
         if hum.Health <= Farm.RetreatHP then
@@ -812,23 +905,83 @@ local function bladeSets()
     return 99 -- unknown = assume fine
 end
 
+--// === AUTO RELOAD ==========================================================
+--// A broken blade means ZERO damage: every hit in this game is gated behind the
+--// ODM gear module's Blade_Check, so a blade-less swing is a wasted swing. The
+--// gear module exposes its own Reload entry (consts: Blade_Check, Blades,
+--// Blade_Drops, AssemblyLinearVelocity...), and Utilities.Blades.Reload backs
+--// it up, with the real R bind as a last resort.
+local AutoReload = { Enabled = true, cooldown = 0, lastLog = 0 }
+
+local function reloadBlades(reason)
+    if os.clock() < (AutoReload.cooldown or 0) then return false end
+    AutoReload.cooldown = os.clock() + 1
+    local ODMG = getgenv().HamasAOT_ODMG
+    if type(ODMG) ~= "table" then
+        pcall(function()
+            ODMG = require(ReplicatedStorage.Modules.Core.ODMG)
+            getgenv().HamasAOT_ODMG = ODMG
+        end)
+    end
+    local did = false
+    pcall(function()
+        if type(ODMG) == "table" and type(ODMG.Reload) == "function" then
+            ODMG.Reload()
+            did = true
+        end
+    end)
+    --// and the game's own action for it (Storage.Actions lists "Reload")
+    pcall(function()
+        if type(InputModule) == "table" and type(InputModule.Action) == "function" then
+            InputModule.Action("Reload")
+            did = true
+        end
+    end)
+    pcall(function()
+        local Blades = require(ReplicatedStorage.Modules.Utilities.Blades)
+        if type(Blades) == "table" and type(Blades.Reload) == "function" then
+            Blades.Reload()
+            did = true
+        end
+    end)
+    --// the real key bind too: input state is part of the gear's own check
+    pcall(function()
+        VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+        task.wait(0.03)
+        VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+    end)
+    if Debug and os.clock() - AutoReload.lastLog > 3 then
+        AutoReload.lastLog = os.clock()
+        Debug:Log("[Reload] blades:", reason or "", did and "(module)" or "(key only)")
+    end
+    return true
+end
+
+--// runs even with the farm off, so your blades never sit broken
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if AutoReload.Enabled or Farm.Enabled then
+            local sets = bladeSets()
+            if type(sets) == "number" and sets <= 1 then
+                reloadBlades("sets=" .. tostring(sets))
+            end
+        end
+    end
+end)
+
 local function needReload()
     if os.clock() < Farm.reloadCooldownUntil then return nil end
     if gasPercent() < Farm.GasThreshold then return "gas" end
-    if bladeSets() <= 1 then return "blades" end
     return nil
 end
 
 local function doReload()
     Farm.reloadCooldownUntil = os.clock() + 12
-    pcall(function()
-        VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-        task.wait(0.05)
-        VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-    end)
+    reloadBlades("farm")
     for _ = 1, 10 do
         task.wait(0.5)
-        if not needReload() then break end
+        if bladeSets() > 1 and gasPercent() >= Farm.GasThreshold then break end
     end
 end
 
@@ -930,9 +1083,6 @@ task.spawn(function()
                     teleportToClosestBlades() -- works from any distance
                     task.wait(0.5)
                     doReload()
-                elseif need == "blades" then
-                    Farm.state = "RELOADING"
-                    doReload()
                 else
                     -- one sweep kills EVERY live titan in parallel, then re-scan
                     Farm.state = "KILLING"
@@ -976,6 +1126,13 @@ local function setFarm(v)
 end
 getgenv().HamasAOT_Farm = Farm
 getgenv().HamasAOT_FarmSet = setFarm   -- getgenv().HamasAOT_FarmSet(true|false)
+getgenv().HamasAOT_SetMode = function(m)  -- "still" | "sweep"
+    if m == "still" or m == "sweep" then
+        Farm.Mode = m
+        return "mode=" .. m
+    end
+    return "mode=" .. tostring(Farm.Mode)
+end
 getgenv().HamasAOT_FarmStatus = function()
     return {
         enabled = Farm.Enabled, state = Farm.state, kills = Farm.kills,
@@ -1028,6 +1185,16 @@ C:CreateToggle("AOT_Stream", { Title = "Streamer Mode (invisible hitbox)", Defau
         if Nape.Enabled then napeRefreshAll() end
         Fluent:Notify({ Title = "HamasClient", Content = v and "Streamer mode ON" or "Streamer mode OFF", Duration = 2 })
     end })
+
+C:CreateSection("Attack speed")
+C:CreateToggle("AOT_InstantHits", { Title = "Instant blade hits",
+    Description = "Patches the gear's swing timing table (M1_Frames) so hits land on frame 1",
+    Default = false, Callback = patchAttackSpeed })
+
+C:CreateSection("Blades")
+C:CreateToggle("AOT_AutoReload", { Title = "Auto reload blades",
+    Description = "Blades break after a few cuts, and a broken blade deals no damage — reloads for you",
+    Default = true, Callback = function(v) AutoReload.Enabled = v end })
 
 C:CreateSection("Anti-Eat")
 C:CreateToggle("AOT_AntiEat", { Title = "Auto Struggle (anti-eat)", Default = false,
