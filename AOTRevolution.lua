@@ -6,6 +6,14 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.26: AUTO REFILL, AT LAST. "theres no auto refill look im 0/3 blades" —
+--//        the reserve (HUD n/m) is your stock of fresh blade SETS: a reload
+--//        SPENDS one, the supply station refills it, and only GAS had an
+--//        automatic trip. Now: reserve empty + segments broken = the farm
+--//        stops, teleports to the station (the same proven GasNozzle finder),
+--//        waits for the sets to restock, presses R once to load them, and
+--//        goes straight back to the lane. No station in the map = one loud
+--//        notice, then keep fighting broken instead of TP-spamming.
 --// v3.25: THE LOG CAUGHT BOTH, LIVE. (1) ":2147: attempt to call a nil value"
 --//        every cycle: bladeSegments() was defined ~330 lines BELOW the [Under]
 --//        logger that calls it — a forward reference to a local that does not
@@ -3001,6 +3009,52 @@ task.spawn(function()
                     Farm.flagAt = os.clock()
                     setFarmFlag(true)
                 end
+                --// v3.26: RESERVE REFILL — the piece that was missing. "theres no
+                --// auto refill look im 0/3 blades": the HUD n/m is the stock of
+                --// fresh blade SETS; a reload SPENDS one, the supply station
+                --// refills it, and until now only GAS had an automatic trip. When
+                --// the reserve is empty AND the blades are actually broken (the
+                --// segment oracle), the farm makes its own station run.
+                local have0, max0 = bladeStats()
+                local seg0, segMax0 = bladeSegments()
+                if have0 == 0 and (segMax0 or 0) > 0 and seg0 < segMax0
+                    and os.clock() > (Farm.refillFailUntil or 0) then
+                    Farm.state = "REFILLING"
+                    stopAttack()
+                    if Debug then Debug:Log("[Refill] reserve empty + blades broken — running to the supply station") end
+                    pcall(function()
+                        Fluent:Notify({ Title = "HamasClient",
+                            Content = "Blade reserve empty — auto-refilling at the supply station", Duration = 3 })
+                    end)
+                    local okR, errR = teleportToClosestBlades()
+                    if not okR then
+                        --// no station in this map: say so once, keep fighting
+                        --// broken rather than teleport-spamming every tick
+                        Farm.refillFailUntil = os.clock() + 30
+                        if Debug then Debug:Log("[Refill] no supply found:", tostring(errR)) end
+                        pcall(function()
+                            Fluent:Notify({ Title = "HamasClient",
+                                Content = "No blade supply found in this map — cannot refill reserve", Duration = 4 })
+                        end)
+                    else
+                        --// the station restocks the SETS; give it a moment, then
+                        --// one R press converts a fresh set into live blades
+                        local tR = os.clock()
+                        while os.clock() - tR < 15 and Farm.Enabled do
+                            task.wait(0.5)
+                            local h1 = select(1, bladeStats())
+                            if (h1 or 0) > 0 then break end
+                        end
+                        local h2, m2 = bladeStats()
+                        if Debug then Debug:Log("[Refill] station run done — reserve",
+                            h2 and (h2 .. "/" .. m2) or "?") end
+                        if (h2 or 0) > 0 and bladeSegments() < (select(2, bladeSegments()) or 0) then
+                            reloadBlades("after refill")
+                        end
+                    end
+                    Farm.state = "KILLING"
+                    continue
+                end
                 local need = needReload()
                 if need == "gas" then
                     Farm.state = "RELOADING"
@@ -3265,7 +3319,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.25 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.26 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.25 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.26 loaded", Duration = 3 })
 end)
