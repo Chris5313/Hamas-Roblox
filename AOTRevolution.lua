@@ -6,6 +6,16 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.5: fixes from live feedback. (1) Swinging no longer synthesizes mouse
+--//        input — it was moving the real cursor and clicking at screen centre
+--//        every SwingDelay, which made the menu unusable; the game's own Slash
+--//        action drives the swing instead, with clicks behind an off-by-default
+--//        "Click for me". (2) The under-map park is ENFORCED every frame now
+--//        (the gear rewrites the HRP every frame, so a one-shot placement slid
+--//        straight back out) and it happens wherever there are no titans, lobby
+--//        included. (3) Blades: the HUD label is found by shape as well as by
+--//        path, any missing set triggers a reload (not just "down to 1"), and
+--//        the reload holds R instead of tapping it.
 --// v3.4: REAL-MOTION PASS. A hand-kill capture proved the geometry of a kill:
 --//        at the instant the server credited the nape hit, the blade parts were
 --//        moving at ~247 studs/s, and incoming ( Effects, Hit, <titan>, Nape )
@@ -44,7 +54,7 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "3.4",
+    Version = "3.5",
     Debug = true,
     Tabs = {
         { Title = "Farming",  Icon = "wheat" },
@@ -70,6 +80,15 @@ local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 local ESP = getgenv().HamasLoad("HamasESP.lua")
 local conns = {}
+
+--// is the user typing in a textbox right now? Every synthesized key/click in
+--// this script checks this first, so nothing ever types into the config name box
+local function typing()
+    local ok, box = pcall(function()
+        return game:GetService("UserInputService"):GetFocusedTextBox()
+    end)
+    return ok and box ~= nil
+end
 
 --// ===========================================================================
 --// ESP — Players (service-driven) + Titans (lobby-safe Collect)
@@ -422,6 +441,9 @@ local Farm = {
                              -- measured to land damage). "still" -> stand on the
                              -- nape and swing: measured 0 damage, debug only
     peakSpeed = 0,           -- peak blade speed seen on the last pass (studs/s)
+    UseSynthClick = false,   -- OFF: never synthesize mouse input. Turning this on
+                             -- makes the client click at screen centre for you,
+                             -- which steals the cursor while the menu is open
     state = "IDLE",
     reloadCooldownUntil = 0,
     lastHop = -1e6,            -- throttle for cross-place teleports
@@ -479,6 +501,7 @@ end
 
 --// --- generic inset-corrected VIM click on any GuiButton (proven on the Retry button)
 local function vimClick(g)
+    if typing() then return false, "typing" end -- never steal clicks from a textbox
     if not (g and g:IsA("GuiButton") and g.Visible and g.AbsoluteSize.X > 0) then return false, "not clickable" end
     local inset = GuiService:GetGuiInset()
     local p, s = g.AbsolutePosition, g.AbsoluteSize
@@ -655,12 +678,61 @@ local function parkY()
     return math.max(floor - Farm.ParkDepth, fpdh + 15)
 end
 
-local function parkUnderPoint(x, z)
+--// Blades break after a few cuts and a broken blade deals no damage, so the
+--// reload state lives up here where the swing thread and the pass loop can read
+--// it (holdUntil = "do not swing on top of a reload in progress").
+local AutoReload = { Enabled = true, cooldown = 0, lastLog = 0, tries = 0, holdUntil = 0, quietUntil = 0 }
+
+--// v3.5 THE PARK. v3.3 set the position ONCE and anchored the root — but the
+--// gear's own physics module writes the HumanoidRootPart every frame, so the
+--// player slid straight back out of the ground ("I'm still not under the
+--// ground"). The park is now ENFORCED every frame instead of once, on both the
+--// pre-simulation and Heartbeat steps, so nothing can overwrite it.
+local Park = { on = false, x = 0, y = 0, z = 0, lastLog = 0 }
+
+local function parkTick()
+    if not Park.on then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    --// never fight a respawn: while you are dead the engine is moving you, and
+    --// yanking the root back down mid-respawn is how you end up stuck falling
+    if not (hrp and hum and hum.Health > 0) then return end
+    hrp.Anchored = true
+    hrp.CFrame = CFrame.new(Park.x, Park.y, Park.z)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+end
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(parkTick)
+pcall(function()
+    conns[#conns + 1] = RunService.PreSimulation:Connect(parkTick)
+end)
+
+local function stopPark()
+    if not Park.on then return end
+    Park.on = false
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.Anchored = false
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+end
+
+getgenv().HamasAOT_StopPark = stopPark
+
+local function parkUnderPoint(x, z, reason)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    hrp.Anchored = true
-    hrp.CFrame = CFrame.new(x, parkY(), z)
+    Park.x, Park.z, Park.y = x, z, parkY()
+    Park.on = true
+    parkTick() -- put us there now; the connection keeps us there
+    if Debug and os.clock() - (Park.lastLog or 0) > 10 then
+        Park.lastLog = os.clock()
+        Debug:Log("[Park] under the map at Y", math.floor(Park.y), reason or "")
+    end
 end
 
 --// the map is rebuilt every mission and we used to scan it once from the lobby,
@@ -701,10 +773,14 @@ end
 local InputModule
 pcall(function() InputModule = require(ReplicatedStorage.Modules.Core.Input) end)
 
-local function action(name)
+local function action(name, pressed)
     if type(InputModule) ~= "table" or type(InputModule.Action) ~= "function" then return false end
-    return pcall(function() InputModule.Action(name) end)
+    --// Action(arity 2) — the game's own signature is (name, pressed); a couple of
+    --// builds only take the name, so try that shape before giving up
+    if pcall(InputModule.Action, name, pressed) then return true end
+    return pcall(InputModule.Action, name)
 end
+
 
 --// ATTACK SPEED lives in ODMG.M1_Frames: every swing type has its hit frame,
 --// e.g. Air_Hit_1 = {11, 30} (hit on frame 11, 30-frame window). Pulling the
@@ -731,14 +807,22 @@ local function patchAttackSpeed(on)
     return true
 end
 
+--// v3.5: swinging NO LONGER TOUCHES YOUR MOUSE. Until now every swing fired
+--// SendMouseMoveEvent + a click at screen centre, which hijacked the real cursor
+--// and clicked whatever sat under it — that is what made the menu unusable while
+--// the farm ran. The game's own action ("Slash", from Storage.Actions.Computer)
+--// is the honest swing and touches nothing of yours; synthesized clicks exist
+--// only behind "Click for me", which is OFF by default.
 local function swing()
-    action("Slash") -- the game's own swing
-    local cam = workspace.CurrentCamera
-    local vp = (cam and cam.ViewportSize) or Vector2.new(800, 600)
-    local cx, cy = vp.X / 2, vp.Y / 2
-    pcall(function() VIM:SendMouseMoveEvent(cx, cy, game) end)
-    pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0) end)
-    pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0) end)
+    action("Slash", true)
+    task.delay(0.03, function() action("Slash", false) end)
+    if Farm.UseSynthClick and not typing() then
+        local cam = workspace.CurrentCamera
+        local vp = (cam and cam.ViewportSize) or Vector2.new(800, 600)
+        local cx, cy = vp.X / 2, vp.Y / 2
+        pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0) end)
+        pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0) end)
+    end
 end
 
 --// the driver: one LinearVelocity on the HRP, world-space, aimed by us every frame
@@ -793,6 +877,16 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     end
 
     local driver = ensurePassDriver(hrp)
+
+    --// a reload needs the gear to hold still for a moment now and then: flying
+    --// through titans mid-reload can cancel the reload, and then we swing on
+    --// broken blades forever (that is the "no damage, no reload" spiral)
+    if os.clock() < (AutoReload.pauseUntil or 0) then
+        if driver then driver.VectorVelocity = Vector3.zero end
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        return
+    end
+
     local center = np.Position
     local reach = math.max(10, Farm.PassReach)
     hrp.Anchored = false -- an anchored part produces no touches at all
@@ -852,6 +946,7 @@ local function passTitan(titan, seconds)
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     local np = titan and napeOf(titan)
     if not (hum and hrp and np) then return false end
+    stopPark() -- out of the ground and onto the lane
     Sweep.axis = laneAxis(np, hrp)
     Sweep.axisAt = os.clock() + 0.25
     --// getting onto the lane may be a teleport (any distance) — that is fine,
@@ -894,7 +989,7 @@ local function passTitan(titan, seconds)
 end
 
 --// under the map, out of reach of everything
-local function parkIdle()
+local function parkIdle(reason)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
@@ -902,7 +997,7 @@ local function parkIdle()
     local np = t and napeOf(t)
     local x, z = hrp.Position.X, hrp.Position.Z
     if np then x, z = np.Position.X, np.Position.Z end
-    parkUnderPoint(x, z)
+    parkUnderPoint(x, z, reason)
 end
 
 local function killSweep()
@@ -913,11 +1008,14 @@ local function killSweep()
 
     ensureKillFloor()
     Attack.active = true
+    stopPark() -- we are flying from here on
 
     --// swings run on their own thread, so a slow click never stalls movement
     task.spawn(function()
         while Attack.active and Farm.Enabled do
-            swing()
+            --// never swing on top of a reload: it cancels the reload and we end
+            --// up with no blades at all
+            if os.clock() >= (AutoReload.holdUntil or 0) then swing() end
             task.wait(Farm.SwingDelay)
         end
     end)
@@ -945,7 +1043,7 @@ local function killSweep()
         --// hurt -> dive under the map until the grab is off you
         if hum.Health <= Farm.RetreatHP then
             Farm.state = "HIDING"
-            parkIdle()
+            parkIdle("hurt")
             local untilT = os.clock() + Farm.RetreatTime
             while os.clock() < untilT and Attack.active and Farm.Enabled do task.wait(0.1) end
             Farm.state = "KILLING"
@@ -995,21 +1093,51 @@ local function gasPercent()
     return ok and v or 100
 end
 
-local function bladeSets()
-    local ok, cur = pcall(function()
-        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        local iface = pg and pg:FindFirstChild("Interface")
-        local hud = iface and iface:FindFirstChild("HUD")
-        local blades = hud and hud:FindFirstChild("Main")
-        blades = blades and blades:FindFirstChild("Top")
-        blades = blades and blades:FindFirstChild("7")
-        blades = blades and blades:FindFirstChild("Blades")
-        local sets = blades and blades:FindFirstChild("Sets")
-        return tonumber((sets.Text:match("^(%d+) / ")))
-    end)
-    if ok and cur ~= nil then return cur end
-    return 99 -- unknown = assume fine
+--// The verified HUD path is Interface.HUD.Main.Top['7'].Blades.Sets, which
+--// reads "2 / 3" — but a hard-coded tab index is a fragile thing to rely on
+--// (it differs in the lobby, and HUDs get restructured), and silently reading
+--// nothing is exactly how "it never auto-reloads" happens. So: try the known
+--// path, then sweep PlayerGui for any "n / m" label that lives under something
+--// called Blades, and remember what we found.
+local BladeHUD = { label = nil, nextSweep = 0 }
+
+local function bladeHUD()
+    local cached = BladeHUD.label
+    if cached and cached.Parent then return cached end
+    BladeHUD.label = nil
+    if os.clock() < BladeHUD.nextSweep then return nil end
+    BladeHUD.nextSweep = os.clock() + 2
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then return nil end
+    local ok, known = pcall(function() return pg.Interface.HUD.Main.Top["7"].Blades.Sets end)
+    if ok and known and known:IsA("TextLabel") then
+        BladeHUD.label = known
+        return known
+    end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text:match("^%d+%s*/%s*%d+") then
+            local parent = d.Parent
+            if d.Name == "Sets" or (parent and parent.Name:lower():find("blade")) then
+                BladeHUD.label = d
+                if Debug then Debug:Log("[Blades] HUD found at", d:GetFullName(), "= \"" .. d.Text .. "\"") end
+                return d
+            end
+        end
+    end
+    return nil
 end
+
+--// how many blade sets are left: have, max (nil when the HUD is not up yet)
+local function bladeStats()
+    local label = bladeHUD()
+    if not label then return nil end
+    local have, max = label.Text:match("(%d+)%s*/%s*(%d+)")
+    have, max = tonumber(have), tonumber(max)
+    if not (have and max) then return nil end
+    return have, max
+end
+
+
 
 --// === AUTO RELOAD ==========================================================
 --// A broken blade means ZERO damage: every hit in this game is gated behind the
@@ -1017,11 +1145,12 @@ end
 --// gear module exposes its own Reload entry (consts: Blade_Check, Blades,
 --// Blade_Drops, AssemblyLinearVelocity...), and Utilities.Blades.Reload backs
 --// it up, with the real R bind as a last resort.
-local AutoReload = { Enabled = true, cooldown = 0, lastLog = 0 }
-
 local function reloadBlades(reason)
     if os.clock() < (AutoReload.cooldown or 0) then return false end
-    AutoReload.cooldown = os.clock() + 1
+    AutoReload.cooldown = os.clock() + 2
+    AutoReload.tries = (AutoReload.tries or 0) + 1
+    --// a reload needs a moment without a swing on top of it
+    AutoReload.holdUntil = os.clock() + 0.5
     local ODMG = getgenv().HamasAOT_ODMG
     if type(ODMG) ~= "table" then
         pcall(function()
@@ -1037,12 +1166,10 @@ local function reloadBlades(reason)
         end
     end)
     --// and the game's own action for it (Storage.Actions lists "Reload")
-    pcall(function()
-        if type(InputModule) == "table" and type(InputModule.Action) == "function" then
-            InputModule.Action("Reload")
-            did = true
-        end
-    end)
+    if action("Reload", true) then
+        did = true
+        task.delay(0.35, function() action("Reload", false) end)
+    end
     pcall(function()
         local Blades = require(ReplicatedStorage.Modules.Utilities.Blades)
         if type(Blades) == "table" and type(Blades.Reload) == "function" then
@@ -1050,15 +1177,28 @@ local function reloadBlades(reason)
             did = true
         end
     end)
-    --// the real key bind too: input state is part of the gear's own check
-    pcall(function()
-        VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-        task.wait(0.03)
-        VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-    end)
+    --// the real key bind too: input state is part of the gear's own check.
+    --// HELD, not tapped — the gear reads a held key, and a 0.03s tap gets missed.
+    --// Skipped entirely while you are typing, so it can never type an "r" in a box.
+    if not typing() then
+        pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game) end)
+        task.delay(0.35, function()
+            pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game) end)
+        end)
+    end
+    local have, max = bladeStats()
     if Debug and os.clock() - AutoReload.lastLog > 3 then
         AutoReload.lastLog = os.clock()
-        Debug:Log("[Reload] blades:", reason or "", did and "(module)" or "(key only)")
+        Debug:Log("[Reload] blades", reason or "", did and "(module+key)" or "(key only)",
+            "| HUD", have and (have .. "/" .. max) or "?", "| held", not typing())
+    end
+    --// show it working (the first few times; after that it would be noise)
+    if os.clock() > (AutoReload.quietUntil or 0) then
+        AutoReload.quietUntil = os.clock() + 8
+        Fluent:Notify({ Title = "HamasClient",
+            Content = ("Reloading blades (%s) — HUD says %s"):format(reason or "auto",
+                have and (have .. " / " .. max) or "?"),
+            Duration = 2 })
     end
     return true
 end
@@ -1068,9 +1208,24 @@ task.spawn(function()
     while true do
         task.wait(0.5)
         if AutoReload.Enabled or Farm.Enabled then
-            local sets = bladeSets()
-            if type(sets) == "number" and sets <= 1 then
-                reloadBlades("sets=" .. tostring(sets))
+            local have, max = bladeStats()
+            --// ANY missing set counts, not just "down to 1": that was why a
+            --// half-broken blade set sat there dealing no damage
+            if have and max and have < max then
+                AutoReload.failingSince = AutoReload.failingSince or os.clock()
+                --// it keeps not taking -> stand still for a second and retry:
+                --// flying through titans mid-reload can cancel the reload, and
+                --// then we swing on broken blades forever
+                if os.clock() - AutoReload.failingSince > 4 then
+                    AutoReload.failingSince = nil
+                    AutoReload.pauseUntil = os.clock() + 1.2
+                    AutoReload.cooldown = 0
+                    if Debug then Debug:Log("[Reload] still broken after 4s - pausing the pass to reload") end
+                end
+                reloadBlades(("sets=%d/%d"):format(have, max))
+            else
+                AutoReload.failingSince = nil
+                AutoReload.pauseUntil = nil
             end
         end
     end
@@ -1087,7 +1242,8 @@ local function doReload()
     reloadBlades("farm")
     for _ = 1, 10 do
         task.wait(0.5)
-        if bladeSets() > 1 and gasPercent() >= Farm.GasThreshold then break end
+        local have, max = bladeStats()
+        if (not have or have >= max) and gasPercent() >= Farm.GasThreshold then break end
     end
 end
 
@@ -1107,8 +1263,12 @@ task.spawn(function()
             if #titans == 0 then
                 Farm.state = "ROUND_END"
                 stopAttack()
-                --// nothing to fight -> sit under the map, out of everyone's reach
-                if workspace:FindFirstChild("Titans") then parkIdle() end
+                --// nothing to fight -> under the map, out of everyone's reach.
+                --// v3.3 only parked where a Titans folder existed, so in the HQ
+                --// (and any place without titans yet) you just stood in the open.
+                if isAOTPlace() or Farm.sawAOT or workspace:FindFirstChild("Titans") then
+                    parkIdle("no titans")
+                end
                 Farm.emptySince = Farm.emptySince or os.clock()
 
                 --// not in AOT at all (or still loading)? The farm only EVER moves
@@ -1216,6 +1376,7 @@ local function setFarm(v)
         Farm.state = "FARMING"
         ensureKillFloor(true)
     else
+        stopPark()
         stopAttack()
         --// hand the player back: last good spot, else where they started
         local ch = LocalPlayer.Character
@@ -1249,6 +1410,12 @@ getgenv().HamasAOT_FarmStatus = function()
         enabled = Farm.Enabled, state = Farm.state, kills = Farm.kills,
         titans = #liveTitans(), place = game.PlaceId, lobby = inLobby(),
         aot = isAOTPlace(), parkY = math.floor(parkY()), nape = Nape.Size,
+        parked = Park.on, parkAt = Park.y and math.floor(Park.y) or nil,
+        bladeHUD = (function()
+            local have, max = bladeStats()
+            return have and (have .. "/" .. max) or nil
+        end)(),
+        synthClick = Farm.UseSynthClick,
         mode = Farm.Mode, passSpeed = Farm.PassSpeed,
         lastPeakBladeSpeed = math.floor(Sweep.peak or 0), bestBladeSpeed = math.floor(Farm.peakSpeed or 0),
         passes = Sweep.passes, driver = Sweep.driver and true or false,
@@ -1307,11 +1474,26 @@ C:CreateSection("Attack speed")
 C:CreateToggle("AOT_InstantHits", { Title = "Instant blade hits",
     Description = "Patches the gear's swing timing table (M1_Frames) so hits land on frame 1",
     Default = false, Callback = patchAttackSpeed })
+C:CreateToggle("AOT_SynthClick", { Title = "Click for me (uses your mouse)",
+    Description = "OFF: the farm drives the game's own Slash action and never touches your mouse, so the menu stays usable. ON: it also clicks at screen centre, which can fight your cursor",
+    Default = false, Callback = function(v) Farm.UseSynthClick = v end })
 
 C:CreateSection("Blades")
 C:CreateToggle("AOT_AutoReload", { Title = "Auto reload blades",
-    Description = "Blades break after a few cuts, and a broken blade deals no damage — reloads for you",
+    Description = "Blades break after a few cuts, and a broken blade deals no damage — reloads the moment a set is missing",
     Default = true, Callback = function(v) AutoReload.Enabled = v end })
+C:CreateButton({ Title = "Reload blades now",
+    Description = "Fires a reload immediately and tells you what the blade HUD actually reads",
+    Callback = function()
+        local have, max = bladeStats()
+        AutoReload.cooldown = 0
+        local ok = reloadBlades("manual")
+        Fluent:Notify({ Title = "HamasClient",
+            Content = ("Reload fired (%s) — blade HUD: %s"):format(
+                ok and "held R + game action" or "skipped, cooldown",
+                have and (have .. " / " .. max) or "not found"),
+            Duration = 3 })
+    end })
 
 C:CreateSection("Anti-Eat")
 C:CreateToggle("AOT_AntiEat", { Title = "Auto Struggle (anti-eat)", Default = false,
@@ -1368,6 +1550,7 @@ getgenv().HamasAOT_Shutdown = function()
     Speed.Enabled = false
     AntiEat.Enabled = false
     Farm.Enabled = false
+    stopPark()
     stopAttack()
 end
 
@@ -1386,4 +1569,4 @@ local function tryResume(attempt)
 end
 tryResume(1)
 
-print("[Hamas] AOT Revolution v3.4 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.5 loaded, place:", game.PlaceId)
