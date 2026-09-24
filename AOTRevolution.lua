@@ -6,6 +6,30 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.10: three bugs, each one traced to a line in YOUR log rather than guessed.
+--//        (1) "parked while Auto Farm says off": the depth slider's Callback
+--//        parks unconditionally, and your saved config re-applies the slider
+--//        ~2s after inject — so a plain inject parked you with the switch off
+--//        ([Farm] OFF / [Park] ... depth slider, same millisecond). The park is
+--//        owned by the switch now: farm off = never park, and it undoes one.
+--//        (2) "it brings me up to the titan's nape": attackMode() fell back to
+--//        "pass" whenever the expander was off, and your log shows
+--//        "[Nape] OFF" then "[Farm] ON (mode pass ...)" — so "auto" is ALWAYS
+--//        under the map now, the expander is switched on when the farm starts,
+--//        and Nape Size is raised automatically until the nape reaches your
+--//        depth (never above the ground, and never anchored).
+--//        (3) "auto reload / auto hit is really weird": the "n / m" HUD label is
+--//        blade SETS IN RESERVE, not blade health. The old rule reloaded on any
+--//        missing set — so it reloaded twice a second, burned 2/3 -> 1/3 -> 0/3
+--//        in 40s, and froze the pass for 1.2s every 4s to "reload", starving the
+--//        swings. Reload is driven by evidence now (empty reserve, or ten seconds
+--//        of swings with nothing dying).
+--//        Under-map attack also MOVES: a blade sitting inside the nape deals
+--//        nothing (measured, repeatedly), so "under" runs the same physics lane
+--//        a pass uses — at your depth instead of the nape's height — and holds Y
+--//        with the constraint, because there is no floor under the map. The park
+--//        also stopped re-measuring the ground from underground, which was the
+--//        ~180-stud up/down flap in your log.
 --// v3.9: three real bugs, all found by reading the code rather than guessing.
 --//        (1) The park dragged you UP because the "ground" was a plain raycast:
 --//        the first thing hit going down could be a titan, another player, or
@@ -176,6 +200,8 @@ end)
 local function stopPark()
     if not Park.on then return end
     Park.on = false
+    --// forget the measured surface: wherever we land next has to re-measure
+    Park.surface = nil
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -554,9 +580,12 @@ local Farm = {
                              -- game's own ODM boost (Input.Action("Boost"))
     RetreatTime = 2,         -- seconds hiding under the map when hurt
     ParkDepth = 60,          -- studs BELOW the ground surface we park (UI slider)
-    Mode = "auto",           -- "auto" (default) -> under the map while the nape
-                             -- expander is on, flying through the nape otherwise.
-                             -- "under"/"pass"/"still" force one of them
+    UnderDwell = 7,          -- seconds running the blade lane under ONE titan
+    Mode = "auto",           -- "auto" (default) = ALWAYS under the map: we hold the
+                             -- depth slider's depth beneath the nape and run the blade
+                             -- lane there. We never fly you up to the titan. "pass"
+                             -- and "still" exist for debugging only, through
+                             -- getgenv().HamasAOT_SetMode("pass")
     peakSpeed = 0,           -- peak blade speed seen on the last pass (studs/s)
     state = "IDLE",
     reloadCooldownUntil = 0,
@@ -779,7 +808,10 @@ end
 --// --- the OP kill: firetouchinterest burst, zero clicks/swings
 local Attack = { active = false }
 local Sweep = { active = false, titan = nil, side = 1, axis = Vector3.new(1, 0, 0), frame = 0,
-                driver = nil, peak = 0, speed = 0, boostAt = 0, slowSince = nil, passes = 0 }
+                driver = nil, peak = 0, speed = 0, boostAt = 0, slowSince = nil, passes = 0,
+                --// under-map lane: where the lane is centred, and whether we have to
+                --// hold our own depth (there is no floor under the map)
+                center = nil, holdY = false }
 
 local function releasePassDriver()
     local d = Sweep.driver
@@ -879,6 +911,13 @@ local function groundYAt(x, z)
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     local ok, y = pcall(function()
         local high = castGround(x, z, 2000, char)
+        --// v3.10: "under the map" is NOT "a roof over my head". While we know we
+        --// are parked, or running an under-map lane, the top surface IS the
+        --// ground. Re-measuring from just under our own feet while we are already
+        --// underground is what made the park flap between heights ~180 studs
+        --// apart on one spot (your log's Y 132 / Y -94 / Y 46 alternation) — the
+        --// shake. Only take the under-my-feet path when we are NOT underground.
+        if Park.on or Sweep.holdY then return high end
         --// a roof above our head is not the ground: look from just under our feet
         if high and hrp and high > hrp.Position.Y + 5 then
             local low = castGround(x, z, hrp.Position.Y + 5, char)
@@ -896,7 +935,21 @@ local function parkY(x, z)
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not x and hrp then x = hrp.Position.X end
     if not z and hrp then z = hrp.Position.Z end
-    local surface = (x and z) and groundYAt(x, z) or (killFloorY or computeKillFloor())
+    local surface
+    --// v3.10: hold on to the surface we measured and reuse it while we stay on
+    --// the same spot. Re-measuring on every tick is what made the park drift and
+    --// shiver — each measurement taken from underground found a lower floor, then
+    --// a lower one again. A real move (>32 studs) re-measures.
+    if Park.surface and x and z
+        and math.abs(x - (Park.surfaceX or x)) < 32
+        and math.abs(z - (Park.surfaceZ or z)) < 32 then
+        surface = Park.surface
+    else
+        surface = (x and z) and groundYAt(x, z) or (killFloorY or computeKillFloor())
+        if x and z then
+            Park.surface, Park.surfaceX, Park.surfaceZ = surface, x, z
+        end
+    end
     local limit = voidLimit()
     local want = surface - Farm.ParkDepth
     Park.clamped = want < limit
@@ -949,8 +1002,11 @@ local function ensureKillFloor(force)
     end
 end
 
---// (nape sizing is owned by the Combat tab's hitbox expander — the farm does
---// not touch it, so there is exactly one place to control it)
+--// (nape sizing is still yours, in the Combat tab. Under-map attack is the one
+--// thing that needs the nape to reach below the ground, so when the farm starts
+--// it turns the expander on and raises Nape Size to whatever your depth needs —
+--// capped at the slider's own maximum. Turn the expander off and it comes back on
+--// the moment the farm needs it again; that is deliberate, it is the mechanism.)
 
 --// v3.4 THE PASS — how this game's blade damage actually lands.
 --// A capture of a real hand-kill says it plainly: at the instant of the nape
@@ -1094,7 +1150,8 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
         return
     end
 
-    local center = np.Position
+    --// "under" runs a lane beneath the titan instead of at the nape's height
+    local center = Sweep.center or np.Position
     local reach = math.max(10, Farm.PassReach)
     hrp.Anchored = false -- an anchored part produces no touches at all
     local delta = (center + Sweep.axis * (reach * Sweep.side)) - hrp.Position
@@ -1104,11 +1161,18 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     end
     local dir = delta.Magnitude > 0.01 and delta.Unit or Sweep.axis
 
+    local vel = dir * Farm.PassSpeed
+    if Sweep.holdY then
+        --// under the map there is nothing to stand on and gravity is real: hold
+        --// our depth with the same constraint, or we sink into the void
+        local dy = center.Y - hrp.Position.Y
+        vel = Vector3.new(vel.X, math.clamp(dy * 8, -Farm.PassSpeed, Farm.PassSpeed), vel.Z)
+    end
     if driver then
-        driver.VectorVelocity = dir * Farm.PassSpeed
+        driver.VectorVelocity = vel
     else
         --// no constraint on this executor build -> best effort only
-        hrp.AssemblyLinearVelocity = dir * Farm.PassSpeed
+        hrp.AssemblyLinearVelocity = vel
     end
     hrp.AssemblyAngularVelocity = Vector3.zero
 
@@ -1147,19 +1211,49 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
 end)
 
 --// ===========================================================================
---// UNDER-MAP ATTACK — what the nape expander is FOR.
+--// UNDER-MAP ATTACK — the farm's ONLY mode (v3.10).
 --//
 --// With "Expand Nape Hitboxes" on, the nape volume grows until it reaches BELOW
---// the ground, and that is what lets you sit under the map — out of reach of
---// every grab — while your blade volume still overlaps the nape. So this mode
---// does NOT fly you out to the titan: it holds you exactly where the depth
---// slider says, underneath the nape's X/Z, swinging the whole time. If the nape
---// box cannot reach your depth it says so, with the Nape Size it needs — you turn
---// it up in the Combat tab, which is your half of the deal. We never move you up
---// to meet it: staying deep is the entire point.
+--// the ground, and that is what lets you stay under the map — out of reach of
+--// every grab — while your blade volume still overlaps the nape. So this never
+--// flies you out to the titan. It holds you at the depth slider's depth, under
+--// the nape's X/Z, and runs the SAME physics lane a real pass uses (a
+--// LinearVelocity straight across the nape volume), because a blade that is
+--// simply SITTING inside the nape deals nothing — the only signature ever
+--// measured on a real kill is a blade TOUCHING the nape at ~180-247 studs/s.
+--// Standing still was measured at zero damage, repeatedly.
+--//
+--// Order of business when the expanded nape cannot reach our depth:
+--//   1. turn the expander on if it is off (nothing works without it),
+--//   2. raise Nape Size to what the depth actually needs (capped at the slider's
+--//      own maximum), and only then
+--//   3. come up just enough to touch — never above the ground surface.
 -- ===========================================================================
+local NAPE_MAX_SIZE = 200
+
 local function napeReachY(nape)
     return nape.Position.Y - (nape.Size.Y * 0.5)
+end
+
+--// grow the expander until its bottom reaches wantY. returns the size in use.
+local napeGrowAt = 0
+local function ensureNapeReach(nape, wantY)
+    local need = math.ceil((nape.Position.Y - wantY) * 2 + 12)
+    if need <= (Nape.Size or 0) then return Nape.Size end
+    local before = Nape.Size
+    Nape.Size = math.min(NAPE_MAX_SIZE, need)
+    if Nape.Enabled then napeRefreshAll() end
+    --// say it out loud (rate-limited) rather than silently changing your slider
+    if os.clock() - napeGrowAt > 10 then
+        napeGrowAt = os.clock()
+        if Debug then Debug:Log("[Under] Nape Size", before, "->", Nape.Size, "to reach Y", math.floor(wantY)) end
+        pcall(function()
+            Fluent:Notify({ Title = "HamasClient",
+                Content = ("Nape Size raised to %d so the nape reaches under the map"):format(Nape.Size),
+                Duration = 4 })
+        end)
+    end
+    return Nape.Size
 end
 
 local function underAttack(titan, seconds)
@@ -1168,33 +1262,89 @@ local function underAttack(titan, seconds)
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     local np = titan and napeOf(titan)
     if not (hum and hrp and np) then return false end
+
+    --// the expander IS the mechanism: without it the nape can never reach under
+    --// the ground, so under mode turns it on itself — visibly, once — instead of
+    --// silently flying you up to the titan the way "pass" used to
+    if not Nape.Enabled then
+        napeSetEnabled(true)
+        Fluent:Notify({ Title = "HamasClient",
+            Content = "Expand Nape Hitboxes ON — the farm needs it to reach you under the map",
+            Duration = 4 })
+    end
+
     local blade = char:FindFirstChild("Hitbox")
     local bladeTop = blade and (blade.Size.Y * 0.5) or 2
+
+    --// the lane runs straight under the nape, at the depth you asked for
+    local x, z = np.Position.X, np.Position.Z
+    local surface = groundYAt(x, z)
+    local want = parkY(x, z) -- below the surface, clamped above the void limit
+
+    stopPark() -- the lane is a physics move; an anchored part touches nothing
+    --// PlatformStand WITHOUT anchoring: the humanoid stops fighting us for
+    --// control, but the body stays physical so contacts are still generated
+    pcall(function() hum.PlatformStand = true end)
+
+    --// if this executor cannot make a LinearVelocity at all there is nothing to
+    --// hold our depth with, and falling means the void — so park instead. A
+    --// static under-map hold deals no damage, but it is safe and it is visible.
+    if not ensurePassDriver(hrp) then
+        parkUnderPoint(np.Position.X, np.Position.Z, "no constraint - static hold")
+        local t = os.clock()
+        while Attack.active and Farm.Enabled and (os.clock() - t) < seconds do
+            local cur = napeOf(titan)
+            if not (cur and cur.Parent and hum.Health > 0) then break end
+            local b = char:FindFirstChild("Hitbox")
+            if b and firetouchinterest then
+                pcall(function()
+                    firetouchinterest(cur, b, 0)
+                    firetouchinterest(cur, b, 1)
+                end)
+            end
+            task.wait(0.05)
+        end
+        pcall(function() hum.PlatformStand = false end)
+        return true
+    end
+
+    Sweep.axis = laneAxis(np, hrp)
+    Sweep.axisAt = os.clock() + 0.25
+    Sweep.titan = titan
+    Sweep.side = 1
+    Sweep.frame = 0
+    Sweep.peak = 0
+    Sweep.slowSince = nil
+    Sweep.center = Vector3.new(x, want, z)
+    Sweep.holdY = true
+    Sweep.active = true
+
     local t0 = os.clock()
     local warnedAt = 0
     while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
         local cur = napeOf(titan)
         if not (cur and cur.Parent and hum.Health > 0) then break end
-        --// exactly the depth the slider asks for, directly under the nape
-        Park.x, Park.z = cur.Position.X, cur.Position.Z
-        Park.y = parkY(Park.x, Park.z)
-        Park.on = true
-        parkTick()
-        --// can the expanded nape reach us? if not, name the Nape Size that would
+
+        --// the titan walks: keep the lane under it, and keep the nape big enough
+        --// to reach our depth
+        local y = want
+        local sizeNow = ensureNapeReach(cur, want)
         local reach = napeReachY(cur)
-        local mine = Park.y + bladeTop
-        if reach > mine + 0.5 and (os.clock() - warnedAt) > 6 then
-            warnedAt = os.clock()
-            local grow = math.ceil((reach - mine) * 2 + 20)
-            Fluent:Notify({ Title = "HamasClient",
-                Content = ("Nape does not reach under the map — set Nape Size to about %d in Combat tab"):format(grow),
-                Duration = 5 })
-            if Debug then
-                Debug:Log("[Under] nape bottom Y", math.floor(reach), "| you at Y", math.floor(Park.y),
-                    "| raise Nape Size to ~" .. grow)
+        if reach > y + bladeTop then
+            --// even a maxed nape cannot reach that deep -> rise just enough to
+            --// touch, but never break the ground surface
+            y = math.max(math.min(reach - bladeTop - 1, surface - 6), voidLimit())
+            if (os.clock() - warnedAt) > 8 then
+                warnedAt = os.clock()
+                if Debug then
+                    Debug:Log("[Under] nape bottom Y", math.floor(reach), "| holding Y", math.floor(y),
+                        "| nape size", sizeNow)
+                end
             end
         end
-        --// a synthesized touch pair on top of the real overlap
+        Sweep.center = Vector3.new(cur.Position.X, y, cur.Position.Z)
+
+        --// a synthesized touch pair every frame on top of the real contacts
         if blade and blade.Parent and firetouchinterest then
             pcall(function()
                 firetouchinterest(cur, blade, 0)
@@ -1203,15 +1353,28 @@ local function underAttack(titan, seconds)
         end
         task.wait(0.05)
     end
+
+    Sweep.active = false
+    Sweep.titan = nil
+    Sweep.center = nil
+    Sweep.holdY = false
+    releasePassDriver()
+    pcall(function() hum.PlatformStand = false end)
+    if Debug and Sweep.peak > 0 then
+        Debug:Log(string.format("[Under] peak blade speed %.0f studs/s (holding %.0f, a real kill is ~247)",
+            Sweep.peak, Farm.PassSpeed))
+    end
     return true
 end
 
---// how we attack this second: "auto" follows the nape expander, because an
---// expanded nape is the only thing that can reach you under the map
+--// how we attack this second. v3.10: "auto" is ALWAYS under the map.
+--// The old rule followed the nape expander and fell back to "pass" whenever the
+--// expander was off — which is exactly the log line "[Farm] ON (mode pass...)"
+--// and exactly why the farm flew you up onto the titan's nape instead of holding
+--// you under the map. There is no fallback any more; up is only ever reached on
+--// purpose, through getgenv().HamasAOT_SetMode("pass").
 local function attackMode()
-    if Farm.Mode == "auto" then
-        return Nape.Enabled and "under" or "pass"
-    end
+    if Farm.Mode == "auto" or Farm.Mode == nil then return "under" end
     return Farm.Mode
 end
 
@@ -1223,6 +1386,8 @@ local function passTitan(titan, seconds)
     local np = titan and napeOf(titan)
     if not (hum and hrp and np) then return false end
     stopPark() -- out of the ground and onto the lane
+    Sweep.center = nil -- "pass" runs the lane at the nape's own height
+    Sweep.holdY = false
     Sweep.axis = laneAxis(np, hrp)
     Sweep.axisAt = os.clock() + 0.25
     --// getting onto the lane may be a teleport (any distance) — that is fine,
@@ -1329,7 +1494,7 @@ local function killSweep()
         if not target then break end
         local before = #alive
         if attackMode() == "under" then
-            underAttack(target, Farm.Dwell)
+            underAttack(target, Farm.UnderDwell)
         else
             passTitan(target, Farm.Dwell)
         end
@@ -1429,8 +1594,11 @@ local function reloadBlades(reason)
     if os.clock() < (AutoReload.cooldown or 0) then return false end
     AutoReload.cooldown = os.clock() + 2
     AutoReload.tries = (AutoReload.tries or 0) + 1
-    --// a reload needs a moment without a swing on top of it
+    --// a reload needs a moment without a swing on top of it, and a brief moment
+    --// without ODM motion — but only a BRIEF one: the old code froze the pass for
+    --// 1.2s at a time, which starved the whole sweep
     AutoReload.holdUntil = os.clock() + 0.5
+    AutoReload.pauseUntil = os.clock() + 0.3
     local ODMG = getgenv().HamasAOT_ODMG
     if type(ODMG) ~= "table" then
         pcall(function()
@@ -1489,23 +1657,33 @@ task.spawn(function()
     while true do
         task.wait(0.5)
         local have, max = bladeStats()
-        --// ANY missing set counts, not just "down to 1": that was why a
-        --// half-broken blade set sat there dealing no damage
-        if have and max and have < max then
-            AutoReload.failingSince = AutoReload.failingSince or os.clock()
-            --// it keeps not taking -> stand still for a second and retry: flying
-            --// through titans mid-reload can cancel the reload, and then we
-            --// swing on broken blades forever
-            if os.clock() - AutoReload.failingSince > 4 then
-                AutoReload.failingSince = nil
-                AutoReload.pauseUntil = os.clock() + 1.2
-                AutoReload.cooldown = 0
-                if Debug then Debug:Log("[Reload] still broken after 4s - pausing the pass to reload") end
+        --// v3.10 — THE AUTO-RELOAD BUG. That "n / m" HUD label counts blade SETS
+        --// IN RESERVE, not blade health: "2 / 3" is the healthy, normal state (one
+        --// set spent). The old rule reloaded on ANY missing set, so it hammered the
+        --// reload twice a second, burned the reserve 2/3 -> 1/3 -> 0/3 in about
+        --// forty seconds, and froze the whole pass for 1.2s every 4s "to reload" —
+        --// which starved the swings. That is the entire "auto reload / auto hit is
+        --// really weird" report, and it was burning blades that were perfectly fine.
+        --// Reload on evidence instead:
+        --//   * the reserve is EMPTY, or
+        --//   * the farm is on, swinging at titans, and nothing has died in 10s.
+        if have and max and have <= 0 then
+            reloadBlades("reserve empty")
+        end
+        if Farm.Enabled and have and have > 0 then
+            if Farm.kills ~= (AutoReload.killsAtCheck or -1) then
+                AutoReload.killsAtCheck = Farm.kills
+                AutoReload.stallSince = nil
+            else
+                AutoReload.stallSince = AutoReload.stallSince or os.clock()
+                if os.clock() - AutoReload.stallSince > 10 then
+                    AutoReload.stallSince = os.clock()
+                    if Debug then Debug:Log("[Reload] nothing dying for 10s — one reload attempt") end
+                    reloadBlades("nothing dying")
+                end
             end
-            reloadBlades(("sets=%d/%d"):format(have, max))
         else
-            AutoReload.failingSince = nil
-            AutoReload.pauseUntil = nil
+            AutoReload.stallSince = nil
         end
     end
 end)
@@ -1662,10 +1840,15 @@ local function setFarm(v)
             Farm.lastSafe = hrp.CFrame
         end
         Farm.state = "FARMING"
+        --// fresh measurement for this mission, and a fresh reload-stall window
+        Park.surface = nil
+        AutoReload.stallSince = nil
+        AutoReload.killsAtCheck = Farm.kills
         ensureKillFloor(true)
     else
         stopPark()
         stopAttack()
+        Park.surface = nil
         --// hand the player back: last good spot, else where they started
         local ch = LocalPlayer.Character
         local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
@@ -1736,8 +1919,22 @@ F:CreateSlider("AOT_ParkDepth", { Title = "Under-map depth (studs)", Default = 6
     Description = "How far BELOW THE GROUND the farm hides you whenever there is nothing to fight, you get low, or you are between rounds. Drag it and he drops in straight away",
     Callback = function(v)
         Farm.ParkDepth = v
-        --// dragging it drops you in immediately, farm on or off: this is the
-        --// manual "put me under the map" control
+        --// v3.10 — "i injected and i was still put under the ground even tho
+        --// auto farm says off". This Callback ALSO fires when your saved config is
+        --// re-applied ~2s after inject, and it used to call parkIdle()
+        --// unconditionally. The log for a plain inject is literally:
+        --//   [Farm] OFF
+        --//   [Park] under the map 60 studs below the surface -> Y 108  depth slider
+        --// The farm owns the park now: with the switch off this only records the
+        --// number, and it makes sure you are NOT parked.
+        if not Farm.Enabled then
+            stopPark()
+            Park.surface = nil
+            if Debug then Debug:Log("[Park] depth set to", v, "(farm is OFF - not parking)") end
+            return
+        end
+        --// dragging it while farming drops you in immediately
+        Park.surface = nil
         parkIdle("depth slider")
         Fluent:Notify({ Title = "HamasClient",
             Content = ("Parking %d studs below the ground%s — now at Y %d"):format(v,
@@ -1750,7 +1947,7 @@ local C = Tabs.Combat
 C:CreateSection("Nape Hitbox")
 C:CreateToggle("AOT_Nape", { Title = "Expand Nape Hitboxes", Default = false,
     Callback = napeSetEnabled })
-C:CreateSlider("AOT_NapeSize", { Title = "Nape Size", Default = 50, Min = 10, Max = 200, Rounding = 0,
+C:CreateSlider("AOT_NapeSize", { Title = "Nape Size", Default = 50, Min = 10, Max = NAPE_MAX_SIZE, Rounding = 0,
     Callback = function(v)
         Nape.Size = v
         if Nape.Enabled then napeRefreshAll() end
@@ -1855,7 +2052,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.9 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.10 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.9 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.10 loaded", Duration = 3 })
 end)
