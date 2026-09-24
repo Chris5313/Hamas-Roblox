@@ -6,6 +6,15 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.15: the swing itself. The v3.14 log shows the triggerbot firing 205 times
+--//        in 56s (correctly rate-limited to the gear's own Input.Frames window)
+--//        and producing ZERO swings — Input.Action("Slash") is a silent no-op,
+--//        which also explains why our Input.Action hook never fired in the probe.
+--//        The real swing entries are Input.Slash(3) and ODMG.M1(2), or the actual
+--//        bound input, which Input.Abbreviations maps. AOT_Swing_RE.lua times each
+--//        candidate against real blade motion and the target's health instead of
+--//        guessing. Also fixed: the auto-reload set its own cooldown BEFORE calling
+--//        reloadBlades, so v3.14 never reloaded at all.
 --// v3.14: two bugs, both mine, both visible in one log.
 --//        (1) The triggerbot fired 676 swings in 45 seconds — about 15 a second —
 --//        while the gear's own Input.Frames = 15 says one swing per ~0.25s. Three
@@ -1426,7 +1435,14 @@ local function napeContact(char)
     return nil
 end
 
---// the gear's own "will it accept a swing" state
+--// WHAT ACTUALLY SWINGS US. Input.Action("Slash") is a silent no-op: the v3.14
+--// log has 205 fires of it and not one swing, and the earlier probe showed the
+--// game never calls Input.Action itself. The real swing entries are Input.Slash
+--// (arity 3) and ODMG.M1 (arity 2), or the genuine input (mouse 1 / the bound
+--// key, which Input.Abbreviations maps for us). We do NOT guess which: the probe
+--// AOT_Swing_RE.lua times each candidate against real blade motion and the
+--// target's health. Until one is proven, this returns false and the keep-alive
+--// falls back to the real input rather than pretending a swing happened.
 local function gearReady()
     if type(InputModule) == "table" then
         local ok, cd = pcall(function() return InputModule.Cooldown end)
@@ -1993,11 +2009,15 @@ task.spawn(function()
                         end)
                     else
                         AutoReload.autoTries = (AutoReload.autoTries or 0) + 1
-                        AutoReload.cooldown = os.clock() + 20
                         if Debug then
                             Debug:Log("[Reload] 10s of nape contact, zero kills -> attempt", AutoReload.autoTries)
                         end
+                        --// v3.15: the cooldown MUST be set AFTER the call. Setting it
+                        --// first made reloadBlades refuse its own invocation, so the
+                        --// v3.14 build never actually reloaded once — the log shows the
+                        --// "attempt" line and no "[Reload] pressed" line at all.
                         reloadBlades("10s contact, no kills")
+                        AutoReload.cooldown = os.clock() + 20
                     end
                 end
             end
@@ -2423,7 +2443,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.14 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.15 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.14 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.15 loaded", Duration = 3 })
 end)
