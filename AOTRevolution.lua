@@ -6,6 +6,20 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.12: TRIGGERBOT. The swing used to be a blind timer (a swing every 0.12s
+--//        whether or not the blade was anywhere near a titan), so most swings
+--//        were thrown at empty air and the rest landed late. The ODM module dump
+--//        names the game's own nape-hit constants — Hitboxes, Blade_Check,
+--//        Hitbox, CFrame, Touched, GetTouchingParts, Hit, Nape, Health — so the
+--//        game asks GetTouchingParts() on the blade Hitbox and looks for the
+--//        Nape. The triggerbot asks that exact question every frame and fires
+--//        Slash on the same frame it is true, gated on the gear's own
+--//        Input.Cooldown/Holding so a swing is never wasted. The old timer is
+--//        kept only as a 0.4s keep-alive.
+--//        Auto-reload is NOT guessed at any more: Blades.Reload and ODMG.Reload
+--//        are arity 2 and we were calling them with no arguments, so a hook
+--//        probe (AOT_Reload_RE.lua) records what the GAME itself passes when you
+--//        press R by hand, and we copy that exactly.
 --// v3.11: "auto farm is totally broken, it wont even teleport me, im like stuck".
 --//        Your log proved it in one line: under the map the lane asked for 240
 --//        studs/s and the blade read 10-24. Under the map you are INSIDE the
@@ -1282,6 +1296,142 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt)
 end)
 
 --// ===========================================================================
+--// TRIGGERBOT — WHEN to hit, taken from the game's own hit path.
+--//
+--// The ODM module dump names the constants of the nape-hit handler:
+--//   Hitboxes, Blade_Check, Hitbox, CFrame, Touched, GetTouchingParts, Hit, Nape, Health
+--// So the game itself asks GetTouchingParts() ON THE BLADE HITBOX and looks for
+--// the Nape. Our trigger is that exact test — not a timer — and the moment it is
+--// true AND the gear will accept a swing (Input.Cooldown is false, from the
+--// module's own state) we fire Slash. Same frame, no SwingDelay, no polling gap,
+--// no swing thrown away on empty air.
+--//
+--// The old blind timer is still here but demoted: it only fires if the contact
+--// test has said nothing for 0.4s, so a blade naming change in a future update
+--// can never leave the farm standing there doing nothing.
+-- ===========================================================================
+local Trigger = { contacts = 0, fires = 0, heldBack = 0, lastFire = 0, lastContact = 0,
+                  held = false, blades = nil, bladesAt = 0, logAt = 0, lastNames = "" }
+
+--// the blades live on the character and the capture names them Main / Copy /
+--// Hitbox (Hitbox is the one with CanTouch true). Cache the list; re-scan once
+--// a second in case the gear respawns them.
+local function bladeParts(char)
+    if Trigger.blades and (os.clock() - Trigger.bladesAt) < 1 then
+        if Trigger.blades[1] and Trigger.blades[1].Parent == char then return Trigger.blades end
+    end
+    local out, names = {}, {}
+    for _, d in ipairs(char:GetChildren()) do
+        if d:IsA("BasePart") and (d.Name == "Hitbox" or d.Name == "Main" or d.Name == "Copy") then
+            out[#out + 1] = d
+            names[#names + 1] = d.Name
+        end
+    end
+    if #out == 0 then --// nested (a tool / model under the character)
+        for _, d in ipairs(char:GetDescendants()) do
+            if d:IsA("BasePart") and (d.Name == "Hitbox" or d.Name == "Main" or d.Name == "Copy") then
+                out[#out + 1] = d
+                names[#names + 1] = d.Name
+            end
+        end
+    end
+    Trigger.blades, Trigger.bladesAt = out, os.clock()
+    local joined = table.concat(names, ",")
+    if joined ~= Trigger.lastNames then
+        Trigger.lastNames = joined
+        if Debug then Debug:Log("[Trigger] blade parts:", joined == "" and "(none found!)" or joined) end
+    end
+    return out
+end
+
+local function isNapePart(p)
+    if not (p and p:IsA("BasePart") and p.Name == "Nape") then return false end
+    return p:FindFirstAncestor("Hitboxes") ~= nil or (p.Parent and p.Parent.Name == "Hit")
+end
+
+--// are we ACTUALLY touching the target's nape right now?
+local function napeContact(char)
+    local nap = Sweep.titan and napeOf(Sweep.titan)
+    if not (nap and nap.Parent) then return nil end
+    local blades = bladeParts(char)
+    for _, blade in ipairs(blades) do
+        if blade.Parent then
+            --// (1) the game's own method, on the blade
+            local ok, touching = pcall(function() return blade:GetTouchingParts() end)
+            if ok and touching then
+                for _, p in ipairs(touching) do
+                    if p == nap or isNapePart(p) then return blade end
+                end
+            end
+        end
+    end
+    --// (2) the same question asked the other way round, in case this build's
+    --// Main/Copy have CanTouch off (the capture shows exactly that)
+    local ok2, inside = pcall(function() return workspace:GetPartsInPart(nap) end)
+    if ok2 and inside then
+        for _, p in ipairs(inside) do
+            if p:IsDescendantOf(char) then
+                for _, blade in ipairs(blades) do
+                    if p == blade then return blade end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+--// the gear's own "will it accept a swing" state
+local function gearReady()
+    if type(InputModule) == "table" then
+        local ok, cd = pcall(function() return InputModule.Cooldown end)
+        if ok and cd == true then return false end
+        local ok2, holding = pcall(function() return InputModule.Holding end)
+        if ok2 and holding == true then return false end
+    end
+    return true
+end
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+    if not (Farm.Enabled and Attack.active) then
+        if Trigger.held then
+            Trigger.held = false
+            action("Slash", false)
+        end
+        return
+    end
+    --// release on the very next frame: Holding must never stick, or the gear
+    --// stops accepting swings altogether
+    if Trigger.held then
+        action("Slash", false)
+        Trigger.held = false
+        return
+    end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (char and hum and hum.Health > 0) then return end
+
+    local blade = napeContact(char)
+    if not blade then return end
+    Trigger.contacts = Trigger.contacts + 1
+    Trigger.lastContact = os.clock()
+    if not gearReady() then
+        Trigger.heldBack = Trigger.heldBack + 1
+    else
+        --// FIRE. This same frame, no delay, no queue.
+        action("Slash", true)
+        Trigger.held = true
+        Trigger.lastFire = os.clock()
+        Trigger.fires = Trigger.fires + 1
+    end
+
+    if Debug and (os.clock() - Trigger.logAt) > 5 then
+        Trigger.logAt = os.clock()
+        Debug:Log("[Trigger] contacts", Trigger.contacts, "| fired", Trigger.fires,
+            "| held back (gear busy)", Trigger.heldBack)
+    end
+end)
+
+--// ===========================================================================
 --// UNDER-MAP ATTACK — the farm's ONLY mode (v3.10).
 --//
 --// With "Expand Nape Hitboxes" on, the nape volume grows until it reaches BELOW
@@ -1510,12 +1660,18 @@ local function killSweep()
     Attack.active = true
     stopPark() -- we are flying from here on
 
-    --// swings run on their own thread, so a slow click never stalls movement
+    --// swings run on their own thread, so a slow click never stalls movement.
+    --// v3.12: this is no longer the primary attacker — the TRIGGERBOT fires the
+    --// instant the blade is inside the nape. This is only a keep-alive, used when
+    --// the contact test has said nothing for 0.4s.
     task.spawn(function()
         while Attack.active and Farm.Enabled do
             --// never swing on top of a reload: it cancels the reload and we end
             --// up with no blades at all
-            if os.clock() >= (AutoReload.holdUntil or 0) then swing() end
+            if os.clock() >= (AutoReload.holdUntil or 0)
+                and (os.clock() - (Trigger.lastContact or 0)) > 0.4 then
+                swing()
+            end
             task.wait(Farm.SwingDelay)
         end
     end)
@@ -2111,7 +2267,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.11 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.12 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.11 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.12 loaded", Duration = 3 })
 end)
