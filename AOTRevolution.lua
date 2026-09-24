@@ -6,6 +6,20 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.20: three fixes, all three traceable to log lines or probe output.
+--//        (1) "dont see the hitbox": the log shows the expander switched ON at
+--//        3414.66 and OFF at 3414.74 — the UI's default callbacks (the same
+--//        burst as ESP/AntiEat "OFF") stomp it back the instant the farm enables
+--//        it. The farm OWNS the expander now: forced on at farm start, size
+--//        auto-raised to whatever the depth needs (slider is a floor, capped at
+--//        400), UI OFF requests refused while farming, handed back on stop.
+--//        (2) "SwingTest doing nothing": it ran (41 lines in the debug buffer)
+--//        but printed nothing to your console. Now every line prints AND it
+--//        dumps require(host)'s keys + sub-tables and tries each sub-table as a
+--//        self. An outer pcall keeps testRunning from wedging on an error.
+--//        (3) its result was used: require(host) PASSES the Loadout and Cache
+--//        checks, so the triggerbot now fires ODMG.M1 / Input.Slash against
+--//        that state table, with Input.Action as last resort.
 --// v3.19: STOP BREAKING THINGS. Two of my own changes were making it worse, not
 --//        better. (1) Auto-growing the nape silently overrode the size you chose and
 --//        built 236+ stud boxes — a part that size can drop your framerate hard
@@ -385,9 +399,13 @@ ESP:Init{ Fluent = Fluent, Window = Window, Tab = Tabs.Visuals, Debug = Debug }
 --// ===========================================================================
 --// Nape hitbox expander (core feature) — restores originals on disable
 --// ===========================================================================
+local Farm --// forward declaration: napeSetEnabled guards on Farm.Enabled (v3.20)
+
 local Nape = {
     Enabled = false,
     Size = 50,
+    sliderSize = 50,      --// what YOU set in the Combat tab (the floor when farming)
+    farmOwned = false,    --// true while the farm forces the expander on
     Streamer = false,     -- true = invisible hitbox, no highlight
     originals = setmetatable({}, { __mode = "k" }),
     applied = setmetatable({}, { __mode = "k" }),
@@ -446,9 +464,39 @@ local function napeRefreshAll()
 end
 
 local function napeSetEnabled(v)
+    --// v3.20: the farm OWNS the expander while it runs. Your log caught the UI's
+    --// default callbacks firing ~0.08s after the farm auto-enabled the expander
+    --// ([Nape] ON size 50 at 3414.66 -> [Nape] OFF (restored) at 3414.74 — same
+    --// burst as the ESP/AntiEat "OFF" lines), so it was OFF the whole session and
+    --// the nape sat ~111 studs above the lane. No hitbox, no contact, no kills.
+    if Farm.Enabled and not v and Nape.farmOwned then
+        if Debug then Debug:Log("[Nape] OFF request ignored — auto farm needs it (toggle the farm off first)") end
+        return
+    end
     Nape.Enabled = v and true or false
     napeRefreshAll()
     if Debug then Debug:Log("[Nape]", Nape.Enabled and ("ON size " .. Nape.Size) or "OFF (restored)") end
+end
+
+--// force the expander on for the farm (keeps your slider value as the floor)
+local function napeForceOn(reason)
+    Nape.farmOwned = true
+    if not Nape.Enabled then
+        Nape.Enabled = true
+        napeRefreshAll()
+    end
+    if Debug then Debug:Log("[Nape] ON (farm-owned, " .. tostring(reason) .. ") size " .. Nape.Size) end
+end
+
+--// hand the expander back when the farm stops — your slider is the boss again
+local function napeFarmRelease()
+    if not Nape.farmOwned then return end
+    Nape.farmOwned = false
+    if Nape.Enabled then
+        Nape.Enabled = false
+        napeRefreshAll()
+        if Debug then Debug:Log("[Nape] OFF (farm released — your Combat-tab toggle is the boss again)") end
+    end
 end
 
 -- keep new spawns covered while enabled (single watcher, no duplicates)
@@ -672,7 +720,7 @@ end
 --// What it never does: touch your mouse or keyboard (the game's own input
 --// actions drive it, so the menu stays yours), or leave an AOT place.
 --// ===========================================================================
-local Farm = {
+Farm = { --// assigns the forward-declared local (napeSetEnabled reads Farm.Enabled)
     Enabled = false,
     --// tuned values (there is no UI for these: one toggle IS the interface)
     SwingDelay = 0.12,       -- seconds between swings while passing
@@ -1220,6 +1268,7 @@ local function gameModule(path)
 end
 
 local InputModule, ODMGModule, BladesModule
+local HostState --// require(host): carries .Loadout/.Cache — the best self measured so far
 
 --// Re-resolve whenever the host changes (a respawn rebuilds char.Actor.Client.Host,
 --// and the modules under it are a different copy). Latching them once at inject
@@ -1232,6 +1281,11 @@ local function refreshModules()
     InputModule = gameModule("Core.Input")
     ODMGModule = gameModule("Core.ODMG")
     BladesModule = gameModule("Utilities.Blades")
+    --// v3.20: cache the state table as the swing self. SelfTest proved it has
+    --// .Loadout and .Cache, which the host instance itself lacks.
+    HostState = nil
+    if host then pcall(function() HostState = require(host) end) end
+    if type(HostState) ~= "table" then HostState = nil end
     if Debug and not GameEnv.reported then
         GameEnv.reported = true
         Debug:Log("[Swing] modules from:", GameEnv.src,
@@ -1291,24 +1345,25 @@ end
 --// a press WITHOUT a release leaves the gear holding the button — and while it is
 --// held it will not accept another swing, not from us and not from YOU either. So
 --// the release is not optional bookkeeping, it is why manual swinging kept working.
---// v3.19: we do NOT know the correct first argument yet. The errors name what it
---// must carry — Loadout (for Input.Slash / ODMG.M1), Cache (ODMG.Reload) and
---// Modules.S_Achievements (Blades.Reload) — and the Host instance has none of
---// them, so ODMG.M1(h) and Input.Slash(h) throw on EVERY swing. Firing entries
---// that are known to throw every frame is noise, not progress. Until
---// getgenv().HamasSwingTest() identifies the real self, we send only the one entry
---// that is harmless (Input.Action), and we say so once.
+--// v3.20: the self-finder run proved require(host) carries .Loadout and .Cache
+--// (the host instance has neither), so the real entries are fired against THAT
+--// state table now. They may still die one level deeper (nil Effects / Weapon) —
+--// the pcall swallows that, Input.Action remains as the last fallback, and the
+--// [Under] titan-HP line remains the only proof that counts.
 local Swing = { logAt = 0, winner = nil, held = false, heldShape = nil, saidIt = false }
-local SWING_ORDER = { "Input.Action" }
+--// real entries first (state self), proven no-op last as the safety net
+local SWING_ORDER = { "ODMG.M1", "Input.Slash", "Input.Action" }
 
 --// returns a function(pressed) for this entry, or nil when it is not available
 local function swingPair(shape, host)
     local M, O = InputModule, ODMGModule
     if not host then return nil end
+    --// self preference: the state table (has Loadout/Cache), else the host
+    local selfArg = (type(HostState) == "table") and HostState or host
     if shape == "ODMG.M1" and type(O) == "table" and type(O.M1) == "function" then
-        return function(p) return pcall(O.M1, host, p) end
+        return function(p) return pcall(O.M1, selfArg, p) end
     elseif shape == "Input.Slash" and type(M) == "table" and type(M.Slash) == "function" then
-        return function(p) return pcall(M.Slash, host, p) end
+        return function(p) return pcall(M.Slash, selfArg, p) end
     elseif shape == "Input.Action" and type(M) == "table" and type(M.Action) == "function" then
         return function(p) return pcall(M.Action, host, "Slash", p) end
     end
@@ -1356,13 +1411,23 @@ local function swing()
             if ok then
                 if Swing.winner ~= shape then
                     Swing.winner = shape
-                    if Debug then Debug:Log("[Swing] using", shape, "(harmless; self still unidentified)") end
+                    if Debug then
+                        if shape == "Input.Action" then
+                            Debug:Log("[Swing] using Input.Action (harmless; real entries refused the state self)")
+                        else
+                            Debug:Log("[Swing] using", shape, "(state self = require(host))")
+                        end
+                    end
                 end
                 Swing.held = true
                 Swing.heldShape = shape
                 if not Swing.saidIt and Debug then
                     Swing.saidIt = true
-                    Debug:Log("[Swing] no proven swing entry yet — run getgenv().HamasSwingTest() to find the self")
+                    if shape == "Input.Action" then
+                        Debug:Log("[Swing] real entries not landing yet — watch titan HP in [Under], run getgenv().HamasSwingTest() if it never drops")
+                    else
+                        Debug:Log("[Swing] firing real swing entries — titan HP dropping in [Under] = it works")
+                    end
                 end
                 return true
             elseif Debug and (os.clock() - Swing.logAt) > 5 then
@@ -1792,28 +1857,39 @@ local function titanFloorY(titan, nape)
     return lowest
 end
 
---// v3.19: this used to RESIZE the nape for you, and that was a mistake twice over.
---// It overrode the size you chose in the Combat tab, and it silently built boxes
---// of 236+ studs — a part that size can drop your framerate hard enough to look
---// like the farm has frozen ("im not moving"). The expander is YOUR control. So
---// this no longer changes anything: it measures what size would be needed, tells
---// you once every 15s, and leaves the decision (and the slider) to you.
+--// v3.20: the expander is FARM-OWNED again, because v3.19's measure-only
+--// version depended on a Combat-tab toggle that the UI's own config callbacks
+--// switch back off 0.08s into every session (proven by log timestamps). While
+--// the farm runs, the size grows to whatever your depth needs — the slider acts
+--// as a FLOOR, never a ceiling — clamped to NAPE_MAX_SIZE (400). When the farm
+--// stops, napeFarmRelease() hands the expander back: off, original sizes.
 local napeGrowAt = 0
 local function ensureNapeReach(nape, wantY)
     local need = math.ceil((nape.Position.Y - wantY) * 2 + 12)
     if need <= (Nape.Size or 0) then return Nape.Size end
+    if Farm.Enabled and Nape.farmOwned then
+        local newSize = math.min(need, NAPE_MAX_SIZE)
+        if newSize ~= Nape.Size then
+            Nape.Size = newSize
+            napeRefreshAll()
+            if os.clock() - napeGrowAt > 10 then
+                napeGrowAt = os.clock()
+                if Debug then
+                    Debug:Log("[Under] nape size auto-raised to " .. newSize ..
+                        " to reach Y " .. math.floor(wantY) ..
+                        " (your slider floor is " .. Nape.sliderSize .. ")")
+                end
+            end
+        end
+        return Nape.Size
+    end
+    --// not farming: measure-only, tell you what it would take
     if os.clock() - napeGrowAt > 15 then
         napeGrowAt = os.clock()
         if Debug then
             Debug:Log("[Under] nape needs size ~" .. math.min(need, NAPE_MAX_SIZE) .. " to reach Y " ..
                 math.floor(wantY) .. " (your slider is " .. math.floor(Nape.Size or 0) .. " — not changing it)")
         end
-        pcall(function()
-            Fluent:Notify({ Title = "HamasClient",
-                Content = ("Nape Size ~%d would reach your depth — raise the slider in Combat if you want it")
-                    :format(math.min(need, NAPE_MAX_SIZE)),
-                Duration = 5 })
-        end)
     end
     return Nape.Size
 end
@@ -1826,14 +1902,11 @@ local function underAttack(titan, seconds)
     if not (hum and hrp and np) then return false end
 
     --// the expander IS the mechanism: without it the nape can never reach under
-    --// the ground, so under mode turns it on itself — visibly, once — instead of
-    --// silently flying you up to the titan the way "pass" used to
-    if not Nape.Enabled then
-        napeSetEnabled(true)
-        Fluent:Notify({ Title = "HamasClient",
-            Content = "Expand Nape Hitboxes ON — the farm needs it to reach you under the map",
-            Duration = 4 })
-    end
+    --// the ground. v3.20: forced on here (and re-asserted — the UI's config
+    --// autoload can stomp it OFF at any time), and the SIZE is raised to what
+    --// your depth actually needs, clamped to the slider's own max. Your slider
+    --// still wins whenever it is bigger.
+    if not Nape.Enabled then napeForceOn("under attack") end
 
     local blade = char:FindFirstChild("Hitbox")
     local bladeTop = blade and (blade.Size.Y * 0.5) or 2
@@ -2419,21 +2492,59 @@ end
 --//     Input.Slash / ODMG.M1 -> arg1.Loadout
 --//     ODMG.Reload           -> arg1.Cache
 --//     Blades.Reload         -> arg1.Modules.S_Achievements
---// The Host instance carries none of those, which is why every attempt so far threw.
---// So try every plausible self against each entry and read the ERROR TEXT: the
---// combination that stops complaining is the one. Input.Action is excluded as a
---// winner — it is the no-op we already proved.
+--// v3.19's run proved require(host) PASSES the Loadout and Cache checks and dies
+--// one level deeper (nil 'Effects' / 'S_Achievements' / 'Weapon') — so the real
+--// self is a richer state table, most likely one of require(host)'s own fields.
+--// v3.20: this PRINTS every line to your console (v3.19 only wrote the debug
+--// buffer, which looked exactly like "doing nothing"), dumps require(host)'s
+--// keys, and auto-tries every sub-table of it as a self.
 --//     getgenv().HamasSwingTest()
 getgenv().HamasSwingTest = function()
     refreshModules()
-    if GameEnv.testRunning then return "already running" end
+    if GameEnv.testRunning then
+        local msg = "already running — wait for the previous pass to finish"
+        print("[HamasSelfTest] " .. msg)
+        return msg
+    end
     local host = gameHost()
     if not host then return "no host (char.Actor.Client.Host)" end
     GameEnv.testRunning = true
     local out = {}
 
+    --// console + debug buffer; the console is the part YOU actually see
+    local function say(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+        local line = table.concat(parts, " ")
+        out[#out + 1] = line
+        print("[HamasSelfTest] " .. line)
+        if Debug then Debug:Log("[SelfTest]", line) end
+    end
+
     local requiredHost
     pcall(function() requiredHost = require(host) end)
+
+    --// what does the state table actually carry? Loadout/Cache live somewhere in
+    --// here — the field that ALSO has Effects / Modules.S_Achievements is the self.
+    if type(requiredHost) == "table" then
+        local keys, subTables = {}, {}
+        for k, v in pairs(requiredHost) do
+            keys[#keys + 1] = tostring(k) .. "=" .. type(v)
+            if type(v) == "table" then subTables[#subTables + 1] = k end
+        end
+        table.sort(keys)
+        say("require(host) keys:", table.concat(keys, " "))
+        for _, k in ipairs(subTables) do
+            local sub = {}
+            for k2, v2 in pairs(requiredHost[k]) do
+                sub[#sub + 1] = tostring(k2) .. "=" .. type(v2)
+            end
+            table.sort(sub)
+            say(("require(host).%s (%d fields): %s"):format(tostring(k), #sub, table.concat(sub, " ")))
+        end
+    else
+        say("require(host) -> " .. type(requiredHost))
+    end
 
     local selves = {
         { "host",          host },
@@ -2445,6 +2556,16 @@ getgenv().HamasSwingTest = function()
         { "Player",        LocalPlayer },
         { "Character",     LocalPlayer.Character },
     }
+    --// every sub-table of require(host) is a candidate self too
+    if type(requiredHost) == "table" then
+        local seen = {}
+        for k, v in pairs(requiredHost) do
+            if type(v) == "table" and not seen[v] then
+                seen[v] = true
+                selves[#selves + 1] = { "require(host)." .. tostring(k), v }
+            end
+        end
+    end
 
     local function titanHP()
         local cur = Sweep.titan and napeOf(Sweep.titan)
@@ -2463,25 +2584,28 @@ getgenv().HamasSwingTest = function()
         { "ODMG.Get_Reload", function(s) return ODMGModule and ODMGModule.Get_Reload(s) end },
     }
 
-    if Debug then Debug:Log("[SelfTest] host:", host:GetFullName(), "| modules from:", GameEnv.src) end
-    for _, e in ipairs(entries) do
-        for _, s in ipairs(selves) do
-            if s[2] ~= nil then
-                local h0 = titanHP()
-                local ok, err = pcall(e[2], s[2])
-                if e[3] then pcall(e[3], s[2]) end --// always release
-                task.wait(0.3)
-                local h1 = titanHP()
-                local line = ("%s(%s) -> %s"):format(e[1], s[1], ok and "CLEAN" or tostring(err))
-                if ok and h0 and h1 and h0 ~= h1 then
-                    line = line .. (("   *** TITAN HP %d -> %d  <- THIS IS IT"):format(h0, h1))
+    --// one pcall around the whole pass: an error used to leave testRunning stuck
+    --// true, which made every later call answer "already running" forever.
+    local okRun, runErr = pcall(function()
+        for _, e in ipairs(entries) do
+            for _, s in ipairs(selves) do
+                if s[2] ~= nil then
+                    local h0 = titanHP()
+                    local ok, err = pcall(e[2], s[2])
+                    if e[3] then pcall(e[3], s[2]) end --// always release
+                    task.wait(0.3)
+                    local h1 = titanHP()
+                    local line = ("%s(%s) -> %s"):format(e[1], s[1], ok and "CLEAN" or tostring(err))
+                    if ok and h0 and h1 and h0 ~= h1 then
+                        line = line .. (("   *** TITAN HP %d -> %d  <- THIS IS IT"):format(h0, h1))
+                    end
+                    say(line)
                 end
-                out[#out + 1] = line
-                if Debug then Debug:Log("[SelfTest]", line) end
             end
         end
-    end
-    if Debug then Debug:Log("[SelfTest] done — the CLEAN one is the right self") end
+    end)
+    if not okRun then say("test errored:", tostring(runErr)) end
+    say("done — CLEAN + a TITAN HP drop marks the real self")
     GameEnv.testRunning = false
     return table.concat(out, "\n")
 end
@@ -2636,9 +2760,14 @@ local function setFarm(v)
         AutoReload.killsAtCheck = Farm.kills
         AutoReload.autoTries = 0
         AutoReload.gaveUp = false
+        --// v3.20: the expander is ours while farming — forced ON before anything
+        --// can measure or reach, size grown on demand in ensureNapeReach().
+        Nape.sliderSize = Nape.sliderSize or Nape.Size
+        napeForceOn("farm start")
         ensureKillFloor(true)
     else
         releaseSwing() -- never hand the game back a held button
+        napeFarmRelease() -- and hand the expander back to the Combat tab
         stopPark()
         stopAttack()
         Park.surface = nil
@@ -2742,7 +2871,8 @@ C:CreateToggle("AOT_Nape", { Title = "Expand Nape Hitboxes", Default = false,
     Callback = napeSetEnabled })
 C:CreateSlider("AOT_NapeSize", { Title = "Nape Size", Default = 50, Min = 10, Max = NAPE_MAX_SIZE, Rounding = 0,
     Callback = function(v)
-        Nape.Size = v
+        Nape.sliderSize = v --// your value; the farm may raise the live size above it
+        Nape.Size = (Farm and Farm.Enabled and Nape.farmOwned and v > Nape.Size) and Nape.Size or v
         if Nape.Enabled then napeRefreshAll() end
     end })
 C:CreateToggle("AOT_Stream", { Title = "Streamer Mode (invisible hitbox)", Default = false,
@@ -2805,6 +2935,7 @@ P:CreateSlider("AOT_SpeedMult", { Title = "Speed Multiplier", Default = 1, Min =
 getgenv().HamasAOT_Shutdown = function()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     conns = {}
+    Nape.farmOwned = false -- shutdown is not a farm stop; do not let the guard re-enable
     Nape.Enabled = false
     eachTitanNape(function(_, nape) restoreNape(nape) end)
     pcall(function() ESP:Shutdown() end)
@@ -2846,7 +2977,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.19 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.20 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.19 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.20 loaded", Duration = 3 })
 end)
