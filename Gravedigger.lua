@@ -271,7 +271,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.0 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.1 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.0 loaded — ESP first", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.1 loaded — ESP first", Duration = 3 })
 end)
