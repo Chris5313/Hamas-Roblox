@@ -6,6 +6,18 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.13: auto-reload, corrected from the RE probe rather than guessed at.
+--//        The probe (AOT_Reload_RE.lua, blades fully broken, R pressed by hand)
+--//        showed the game does NOT reload through Blades.Reload / ODMG.Reload /
+--//        ODMG.Get_Reload / Input.Action — none of our hooks fired — so every
+--//        module reload call this script made was reaching nothing. It also
+--//        showed the "n / m" HUD label is the blade RESERVE (3/3 while the blades
+--//        were FULLY BROKEN), which is why a trigger keyed off it never fired.
+--//        Reload now presses R / the game's Reload action (the one path ever seen
+--//        to work) and triggers on the observable effect instead: in contact with
+--//        a nape, swinging, nothing dying. Blade-part before/after snapshots are
+--//        logged so the broken-blade signature gets captured, and it gives up
+--//        loudly after three fruitless reloads instead of burning your reserve.
 --// v3.12: TRIGGERBOT. The swing used to be a blind timer (a swing every 0.12s
 --//        whether or not the blade was anywhere near a titan), so most swings
 --//        were thrown at empty air and the rest landed late. The ODM module dump
@@ -1800,11 +1812,35 @@ end
 
 
 --// === AUTO RELOAD ==========================================================
---// A broken blade means ZERO damage: every hit in this game is gated behind the
---// ODM gear module's Blade_Check, so a blade-less swing is a wasted swing. The
---// gear module exposes its own Reload entry (consts: Blade_Check, Blades,
---// Blade_Drops, AssemblyLinearVelocity...), and Utilities.Blades.Reload backs
---// it up, with the real R bind as a last resort.
+--// WHAT THE PROBE ACTUALLY PROVED. AOT_Reload_RE.lua was run with the blades
+--// FULLY BROKEN and R pressed by hand, and it reloaded them. What it captured:
+--//   * ZERO of our hooks fired — not Blades.Reload, not ODMG.Reload, not
+--//     ODMG.Get_Reload, not Input.Action. The game does NOT reload through those
+--//     module table entries, so every ODMG.Reload()/Blades.Reload() call this
+--//     script used to make was reaching nothing at all. That, not the trigger,
+--//     was why "auto reload" never worked.
+--//   * ODMG.Get_Reload() returns nil, and NO numeric field on Blades or ODMG
+--//     changes when blades break. There is no readable durability number.
+--//   * The only reload ever observed to work is the R key.
+--// So: reload the way the game does (press R / the game's own Reload action), and
+--// detect a broken blade by its observable EFFECT — we are touching a nape, the
+--// triggerbot is swinging, and nothing is dying. Every attempt logs a before/after
+--// blade-part snapshot, so the next log gives us the exact broken-blade signature.
+--// Fruitless attempts are counted: after a few we stop and say so, instead of
+--// grinding the blade reserve down for nothing.
+local function bladeSnapshot()
+    local char = LocalPlayer.Character
+    if not char then return "no character" end
+    local out = {}
+    for _, b in ipairs(bladeParts(char)) do
+        out[#out + 1] = ("%s[size=%.1f,%.1f,%.1f trans=%.2f ltm=%.2f cantouch=%s]"):format(
+            b.Name, b.Size.X, b.Size.Y, b.Size.Z, b.Transparency,
+            b.LocalTransparencyModifier or 0, tostring(b.CanTouch))
+    end
+    if #out == 0 then return "(no blade parts on character)" end
+    return table.concat(out, " ")
+end
+
 local function reloadBlades(reason)
     if os.clock() < (AutoReload.cooldown or 0) then return false end
     AutoReload.cooldown = os.clock() + 2
@@ -1814,52 +1850,51 @@ local function reloadBlades(reason)
     --// 1.2s at a time, which starved the whole sweep
     AutoReload.holdUntil = os.clock() + 0.5
     AutoReload.pauseUntil = os.clock() + 0.3
-    local ODMG = getgenv().HamasAOT_ODMG
-    if type(ODMG) ~= "table" then
-        pcall(function()
-            ODMG = require(ReplicatedStorage.Modules.Core.ODMG)
-            getgenv().HamasAOT_ODMG = ODMG
-        end)
-    end
+    local before = bladeSnapshot()
     local did = false
-    pcall(function()
-        if type(ODMG) == "table" and type(ODMG.Reload) == "function" then
-            ODMG.Reload()
-            did = true
-        end
-    end)
-    --// and the game's own action for it (Storage.Actions lists "Reload")
+    --// (1) the game's own action API — WE KNOW this drives the gear, because
+    --// Input.Action("Slash") is what swings us. Pressed then released, like Slash.
     if action("Reload", true) then
         did = true
-        task.delay(0.35, function() action("Reload", false) end)
+        task.delay(0.15, function() action("Reload", false) end)
     end
-    pcall(function()
-        local Blades = require(ReplicatedStorage.Modules.Utilities.Blades)
-        if type(Blades) == "table" and type(Blades.Reload) == "function" then
-            Blades.Reload()
-            did = true
-        end
-    end)
-    --// the real key bind too: input state is part of the gear's own check.
-    --// HELD, not tapped — the gear reads a held key, and a 0.03s tap gets missed.
-    --// Skipped entirely while you are typing, so it can never type an "r" in a box.
+    --// (2) the real R bind: the ONE reload ever observed to work. HELD briefly,
+    --// not tapped, because the gear reads held input. Skipped while you are typing
+    --// so it can never type an "r" into a text box.
     if not typing() then
         pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game) end)
-        task.delay(0.35, function()
+        task.delay(0.15, function()
             pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game) end)
         end)
     end
+    --// (3) the module entries, kept only as a harmless extra. The probe showed the
+    --// game never goes through them — do not expect anything from these.
+    pcall(function()
+        local ODMG = getgenv().HamasAOT_ODMG
+        if type(ODMG) ~= "table" then
+            ODMG = require(ReplicatedStorage.Modules.Core.ODMG)
+            getgenv().HamasAOT_ODMG = ODMG
+        end
+        if type(ODMG) == "table" and type(ODMG.Reload) == "function" then ODMG.Reload() end
+    end)
+    --// the AFTER snapshot, so the log carries the real result of the attempt
+    task.delay(0.9, function()
+        if Debug then
+            Debug:Log("[Blade] before", before)
+            Debug:Log("[Blade] after ", bladeSnapshot())
+        end
+    end)
     local have, max = bladeStats()
-    if Debug and os.clock() - AutoReload.lastLog > 3 then
+    if Debug then
         AutoReload.lastLog = os.clock()
-        Debug:Log("[Reload] blades", reason or "", did and "(module+key)" or "(key only)",
-            "| HUD", have and (have .. "/" .. max) or "?", "| held", not typing())
+        Debug:Log("[Reload] pressed", reason or "", "| Reload action accepted:", tostring(did),
+            "| reserve", have and (have .. "/" .. max) or "?", "| simulated key:", not typing())
     end
-    --// show it working (the first few times; after that it would be noise)
+    --// show it, but not on every attempt
     if os.clock() > (AutoReload.quietUntil or 0) then
         AutoReload.quietUntil = os.clock() + 8
         Fluent:Notify({ Title = "HamasClient",
-            Content = ("Reloading blades (%s) — HUD says %s"):format(reason or "auto",
+            Content = ("Reloading blades (%s) — reserve %s"):format(reason or "auto",
                 have and (have .. " / " .. max) or "?"),
             Duration = 2 })
     end
@@ -1872,30 +1907,55 @@ task.spawn(function()
     while true do
         task.wait(0.5)
         local have, max = bladeStats()
-        --// v3.10 — THE AUTO-RELOAD BUG. That "n / m" HUD label counts blade SETS
-        --// IN RESERVE, not blade health: "2 / 3" is the healthy, normal state (one
-        --// set spent). The old rule reloaded on ANY missing set, so it hammered the
-        --// reload twice a second, burned the reserve 2/3 -> 1/3 -> 0/3 in about
-        --// forty seconds, and froze the whole pass for 1.2s every 4s "to reload" —
-        --// which starved the swings. That is the entire "auto reload / auto hit is
-        --// really weird" report, and it was burning blades that were perfectly fine.
-        --// Reload on evidence instead:
-        --//   * the reserve is EMPTY, or
-        --//   * the farm is on, swinging at titans, and nothing has died in 10s.
+        --// v3.13 — THE REAL TRIGGER, corrected from the probe.
+        --// The "n / m" label is the blade RESERVE, and your own capture shows it
+        --// reading 3/3 with the blades FULLY BROKEN — so anything keyed off it can
+        --// never fire while you still have reserve sets, which is why auto-reload
+        --// sat there doing nothing. There is no readable durability number
+        --// anywhere (Get_Reload() is nil, no numeric field changes), so a broken
+        --// blade is detected by its EFFECT from here:
+        --//   the triggerbot is IN CONTACT with a nape, swings are going out, and
+        --//   nothing is dying. That is what a broken blade looks like.
         if have and max and have <= 0 then
             reloadBlades("reserve empty")
         end
-        if Farm.Enabled and have and have > 0 then
+        if Farm.Enabled and (have or 0) > 0 and Attack.active then
             if Farm.kills ~= (AutoReload.killsAtCheck or -1) then
                 AutoReload.killsAtCheck = Farm.kills
                 AutoReload.stallSince = nil
-            else
+                AutoReload.fruitless = 0
+                AutoReload.gaveUp = false
+            elseif (os.clock() - (Trigger.lastContact or 0)) < 1.5 then
+                --// we are touching a nape right now and swinging at it
                 AutoReload.stallSince = AutoReload.stallSince or os.clock()
-                if os.clock() - AutoReload.stallSince > 10 then
+                if os.clock() - AutoReload.stallSince > 4 then
                     AutoReload.stallSince = os.clock()
-                    if Debug then Debug:Log("[Reload] nothing dying for 10s — one reload attempt") end
-                    reloadBlades("nothing dying")
+                    if (AutoReload.fruitless or 0) >= 3 then
+                        --// three reloads and still nothing dying: the blade is NOT
+                        --// the reason. Stop grinding the reserve down and say so.
+                        if not AutoReload.gaveUp then
+                            AutoReload.gaveUp = true
+                            AutoReload.quietUntil = os.clock() + 300
+                            if Debug then
+                                Debug:Log("[Reload] 3 reloads changed nothing — the blade is not why nothing dies")
+                            end
+                            pcall(function()
+                                Fluent:Notify({ Title = "HamasClient",
+                                    Content = "Reloads are not helping — blades are not why nothing is dying",
+                                    Duration = 5 })
+                            end)
+                        end
+                    else
+                        AutoReload.fruitless = (AutoReload.fruitless or 0) + 1
+                        if Debug then
+                            Debug:Log("[Reload] in contact + swinging + nothing dying -> reload",
+                                AutoReload.fruitless)
+                        end
+                        reloadBlades("contact, no kills")
+                    end
                 end
+            else
+                AutoReload.stallSince = nil
             end
         else
             AutoReload.stallSince = nil
@@ -2059,6 +2119,8 @@ local function setFarm(v)
         Park.surface = nil
         AutoReload.stallSince = nil
         AutoReload.killsAtCheck = Farm.kills
+        AutoReload.fruitless = 0
+        AutoReload.gaveUp = false
         ensureKillFloor(true)
     else
         stopPark()
@@ -2267,7 +2329,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.12 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.13 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.12 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.13 loaded", Duration = 3 })
 end)
