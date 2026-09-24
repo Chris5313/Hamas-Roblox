@@ -966,13 +966,21 @@ local function nearestTitan()
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil end
-    local best, bestD
+    --// v3.22: from UNDER the map, plain 3D distance lies — a titan 150 studs
+    --// straight up scores "closer" than one 400 studs away at our depth, and
+    --// after a kill the farm can keep sweeping a dead zone while live titans
+    --// stand in view. We ride a lane UNDER each titan (the teleport puts us on
+    --// it), so vertical separation is free: rank by flat distance first.
+    local best, bestD, bestAlt, bestAltD
     for _, t in ipairs(liveTitans()) do
         local nape = napeOf(t)
         local d = (nape.Position - hrp.Position).Magnitude
-        if not bestD or d < bestD then best, bestD = t, d end
+        if math.abs(nape.Position.Y - hrp.Position.Y) <= 300 then
+            if not bestD or d < bestD then best, bestD = t, d end
+        end
+        if not bestAltD or d < bestAltD then bestAlt, bestAltD = t, d end
     end
-    return best, bestD
+    return best or bestAlt, bestD or bestAltD
 end
 
 --// --- the OP kill: firetouchinterest burst, zero clicks/swings
@@ -1670,6 +1678,22 @@ end)
 -- ===========================================================================
 conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt)
     if not Sweep.cframeLane then return end
+    --// v3.22 WATCHDOG. The under-attack thread owns the cleanup
+    --// (cframeLane=false), so if that thread ever dies mid-loop — any uncaught
+    --// error kills a task.spawn silently — this heartbeat swept the last dead
+    --// titan's lane FOREVER (your v3.21 log: 90s of [Lane] at Y -82 with no
+    --// [Under] after it, farm wedged on one spot). Attack/Farm are the truth:
+    --// if either says stop, tear the lane down right here.
+    if not (Attack.active and Farm.Enabled) then
+        Sweep.cframeLane = false
+        Sweep.titan = nil
+        Sweep.center = nil
+        local ch0 = LocalPlayer.Character
+        local h0 = ch0 and ch0:FindFirstChildOfClass("Humanoid")
+        if h0 then pcall(function() h0.PlatformStand = false end) end
+        if Debug then Debug:Log("[Lane] watchdog — attack thread gone, lane released") end
+        return
+    end
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -1993,6 +2017,18 @@ local function underAttack(titan, seconds)
     local np = titan and napeOf(titan)
     if not (hum and hrp and np) then return false end
 
+    --// v3.22: remember this target's starting HP and say WHO we are attacking,
+    --// so "stuck on one titan" vs "working the next one" is readable from the log
+    local hp0
+    do
+        local tm0 = np:FindFirstAncestorOfClass("Model")
+        local th0 = tm0 and tm0:FindFirstChildOfClass("Humanoid")
+        if Debug then
+            Debug:Log("[Under] target", tm0 and tm0.Name or "?", "HP", th0 and math.floor(th0.Health) or "?")
+        end
+        hp0 = th0 and th0.Health or nil
+    end
+
     --// the expander IS the mechanism: without it the nape can never reach under
     --// the ground. v3.20: forced on here (and re-asserted — the UI's config
     --// autoload can stomp it OFF at any time), and the SIZE is raised to what
@@ -2090,11 +2126,19 @@ local function underAttack(titan, seconds)
     Sweep.titan = nil
     Sweep.center = nil
     pcall(function() hum.PlatformStand = false end)
+    --// v3.22: tell the driver this target is DONE (dead or unreachable) so it
+    --// picks a NEW titan instead of double-counting the same one
+    local died = false
+    do
+        local tm1 = np:FindFirstAncestorOfClass("Model")
+        local th1 = tm1 and tm1:FindFirstChildOfClass("Humanoid")
+        if hp0 and th1 then died = th1.Health <= 0 or th1.Health < hp0 end
+    end
     if Debug and Sweep.peak > 0 then
         Debug:Log(string.format("[Under] peak blade speed %.0f studs/s (holding %.0f, a real kill is ~247)",
             Sweep.peak, Farm.PassSpeed))
     end
-    return true
+    return died
 end
 
 --// how we attack this second. v3.10: "auto" is ALWAYS under the map.
@@ -2230,13 +2274,22 @@ local function killSweep()
         local target = nearestTitan()
         if not target then break end
         local before = #alive
+        --// v3.22: an error inside underAttack used to unwind THIS loop silently
+        --// (Attack.active stayed true, targeting never restarted, lane kept
+        --// sweeping — the "stuck" report). Contain it, log it, reset cleanly:
+        --// the farm loop re-enters killSweep on the next tick and re-targets.
+        local okAtk, errAtk, targetDown
         if attackMode() == "under" then
-            underAttack(target, Farm.UnderDwell)
+            okAtk, errAtk, targetDown = pcall(underAttack, target, Farm.UnderDwell)
         else
-            passTitan(target, Farm.Dwell)
+            okAtk, errAtk = pcall(passTitan, target, Farm.Dwell)
+        end
+        if not okAtk then
+            if Debug then Debug:Log("[Under] attack errored — resetting attack loop:", tostring(errAtk)) end
+            stopAttack()
         end
         local killed = before - #liveTitans()
-        if killed > 0 then
+        if killed > 0 or targetDown then
             Farm.kills = Farm.kills + killed
             Fluent:Notify({ Title = "HamasClient",
                 Content = ("Titan down — %d at %.0f studs/s"):format(killed, Sweep.peak), Duration = 2 })
