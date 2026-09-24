@@ -6,6 +6,17 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.16: THE HOST, and the durability oracle. The swing probe's errors showed
+--//        every gear function indexes its FIRST ARGUMENT for .Modules — so it
+--//        wants char.Actor.Client.Host, and it wants the module copy that lives
+--//        under it, not the ReplicatedStorage one we were calling and hooking.
+--//        That is why every call we ever made was a silent no-op. Modules are now
+--//        resolved from the host, all calls pass the host first, and the swing
+--//        falls through ODMG.M1(host) -> Input.Slash(host) -> Input.Action(host,...)
+--//        logging which shape is clean. The probe's character dump also revealed
+--//        the real blades — Rig_*.RightHand.Blade_1..7 and LeftHand.Blade_1..7 —
+--//        so blade durability is now READ, by counting the segments, instead of
+--//        being guessed at from a reserve label.
 --// v3.15: the swing itself. The v3.14 log shows the triggerbot firing 205 times
 --//        in 56s (correctly rate-limited to the gear's own Input.Frames window)
 --//        and producing ZERO swings — Input.Action("Slash") is a silent no-op,
@@ -1094,15 +1105,99 @@ end
 --// action the input module drives: "Slash", "Reload", "Hook", "Boost",
 --// "Skill_1".."Skill_5". Calling Input.Action("Slash") is the honest swing —
 --// we wasted a while calling Input.Action("M1"), which is not an action at all.
-local InputModule
-pcall(function() InputModule = require(ReplicatedStorage.Modules.Core.Input) end)
+--// ===========================================================================
+--// THE HOST — what every one of these functions actually wants as its first
+--// argument, and the reason NOTHING we called ever worked.
+--//
+--// The swing probe's own error messages gave it away (AOT_Swing_RE.txt):
+--//   Input.Slash()        -> Input:89:  attempt to index nil with 'Modules'
+--//   ODMG.M1(true)        -> ODMG:852:  attempt to index boolean with 'Modules'
+--//   ODMG.M1(LocalPlayer) -> Modules is not a valid member of Player "sebawar"
+--// Each one indexes ITS FIRST ARGUMENT looking for .Modules, then takes .Effects
+--// and .Core.Input out of that. A string does NOT error on .Modules (it returns
+--// nil), which is why our no-argument and name-only calls all looked "fine" and
+--// did precisely nothing. That is the whole mystery of the silent no-op swing.
+--//
+--// And your character dump shows exactly that object:
+--//   Workspace.Characters.<you>.Actor.Client.Host.Modules.Utilities.Blades
+--// So the host is char.Actor.Client.Host, it carries Modules.Core.Input,
+--// Modules.Core.ODMG and Modules.Utilities.Blades, and the game runs THAT copy —
+--// not the ReplicatedStorage one we were hooking and calling. Two different tables,
+--// which is also why none of the probe hooks ever fired.
+-- ===========================================================================
+local GameEnv = { host = nil, at = 0, src = "none", reported = false }
 
+local function gameHost()
+    if GameEnv.host and GameEnv.host.Parent and os.clock() < (GameEnv.at or 0) then
+        return GameEnv.host
+    end
+    GameEnv.host, GameEnv.at = nil, os.clock() + 1
+    local char = LocalPlayer.Character
+    local actor = char and char:FindFirstChild("Actor")
+    local client = actor and actor:FindFirstChild("Client")
+    local host = client and client:FindFirstChild("Host")
+    if host and host:FindFirstChild("Modules") then GameEnv.host = host end
+    return GameEnv.host
+end
+
+--// the modules the GAME is actually running: the host copy when we can see it,
+--// the ReplicatedStorage copy only as a fallback. Never silently mix the two.
+local function gameModule(path)
+    local got
+    local host = gameHost()
+    if host then
+        pcall(function()
+            local node = host.Modules
+            for part in path:gmatch("[^.]++") do node = node[part] end
+            got = require(node)
+        end)
+        if type(got) == "table" then GameEnv.src = "host" return got end
+    end
+    pcall(function()
+        local node = ReplicatedStorage.Modules
+        for part in path:gmatch("[^.]++") do node = node[part] end
+        got = require(node)
+    end)
+    if type(got) == "table" then GameEnv.src = "replicated-fallback" end
+    return got
+end
+
+local InputModule, ODMGModule, BladesModule
+
+--// Re-resolve whenever the host changes (a respawn rebuilds char.Actor.Client.Host,
+--// and the modules under it are a different copy). Latching them once at inject
+--// time would silently pin us to the ReplicatedStorage copy again.
+local function refreshModules()
+    local host = gameHost()
+    if GameEnv.modHost == host and type(InputModule) == "table" then return end
+    GameEnv.modHost = host
+    GameEnv.src = "none"
+    InputModule = gameModule("Core.Input")
+    ODMGModule = gameModule("Core.ODMG")
+    BladesModule = gameModule("Utilities.Blades")
+    if Debug and not GameEnv.reported then
+        GameEnv.reported = true
+        Debug:Log("[Swing] modules from:", GameEnv.src,
+            "| host:", host and host:GetFullName() or "NOT FOUND",
+            "| Input.Action:", tostring(type(InputModule) == "table" and type(InputModule.Action) == "function"),
+            "| Input.Slash:", tostring(type(InputModule) == "table" and type(InputModule.Slash) == "function"),
+            "| ODMG.M1:", tostring(type(ODMGModule) == "table" and type(ODMGModule.M1) == "function"))
+    end
+end
+
+refreshModules()
+
+--// every one of these takes the HOST first (that is what the errors say), so the
+--// name goes second and the pressed flag third. Shapes are tried in that order.
 local function action(name, pressed)
-    if type(InputModule) ~= "table" or type(InputModule.Action) ~= "function" then return false end
-    --// Action(arity 2) — the game's own signature is (name, pressed); a couple of
-    --// builds only take the name, so try that shape before giving up
-    if pcall(InputModule.Action, name, pressed) then return true end
-    return pcall(InputModule.Action, name)
+    refreshModules()
+    local host = gameHost()
+    if not host then return false end
+    local M = InputModule
+    if type(M) ~= "table" or type(M.Action) ~= "function" then return false end
+    if pcall(M.Action, host, name, pressed) then return true end
+    if pcall(M.Action, host, pressed) then return true end
+    return pcall(M.Action, host, name)
 end
 
 
@@ -1131,24 +1226,61 @@ local function patchAttackSpeed(on)
     return true
 end
 
---// v3.5: swinging NO LONGER TOUCHES YOUR MOUSE (that is what made the menu
---// unusable: every swing moved the real cursor and clicked at screen centre).
---// The game's own action ("Slash", from Storage.Actions.Computer) is the honest
---// swing and uses nothing of yours.
-local function swing()
-    action("Slash", true)
-    task.delay(0.03, function() action("Slash", false) end)
-    --// synthesized clicks exist ONLY as a fallback for a build with no action
-    --// API at all — it is automatic, there is no switch, and on a normal client
-    --// it never runs, so your mouse is never touched
-    local needsClick = not (type(InputModule) == "table" and type(InputModule.Action) == "function")
-    if needsClick and not typing() then
-        local cam = workspace.CurrentCamera
-        local vp = (cam and cam.ViewportSize) or Vector2.new(800, 600)
-        local cx, cy = vp.X / 2, vp.Y / 2
-        pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0) end)
-        pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0) end)
+--// THE SWING, host-aware. The probe proved Input.Action(name, pressed) is a silent
+--// no-op — 205 fires, zero swings — and the error messages showed why: these
+--// functions want the HOST as argument one. So we try the real entries with the
+--// host first and stop at the first one that does not throw. Your mouse is never
+--// touched: no synthesized click anywhere on this path.
+local Swing = { logAt = 0, winner = nil }
+local SWING_ORDER = { "ODMG.M1(host)", "Input.Slash(host)", "Input.Action(host,name,true)", "Input.Action(host,true)" }
+
+local function swingShape(shape, host)
+    local M, O = InputModule, ODMGModule
+    if shape == "ODMG.M1(host)" and type(O) == "table" and type(O.M1) == "function" then
+        return pcall(O.M1, host)
+    elseif shape == "Input.Slash(host)" and type(M) == "table" and type(M.Slash) == "function" then
+        return pcall(M.Slash, host)
+    elseif shape == "Input.Action(host,name,true)" and type(M) == "table" and type(M.Action) == "function" then
+        return pcall(M.Action, host, "Slash", true)
+    elseif shape == "Input.Action(host,true)" and type(M) == "table" and type(M.Action) == "function" then
+        return pcall(M.Action, host, true)
     end
+    return false, "not available"
+end
+
+local function swing()
+    refreshModules()
+    local host = gameHost()
+    if not host then
+        if Debug and (os.clock() - Swing.logAt) > 10 then
+            Swing.logAt = os.clock()
+            Debug:Log("[Swing] no host (char.Actor.Client.Host) — cannot swing")
+        end
+        return false
+    end
+    --// once one entry has proven clean we lead with it, but we still fall through
+    --// the others if it ever starts throwing
+    local order = SWING_ORDER
+    if Swing.winner then
+        order = { Swing.winner }
+        for _, s in ipairs(SWING_ORDER) do
+            if s ~= Swing.winner then order[#order + 1] = s end
+        end
+    end
+    for _, shape in ipairs(order) do
+        local ok, err = swingShape(shape, host)
+        if ok then
+            if Swing.winner ~= shape then
+                Swing.winner = shape
+                if Debug then Debug:Log("[Swing] using", shape) end
+            end
+            return true
+        elseif Debug and (os.clock() - Swing.logAt) > 5 then
+            Swing.logAt = os.clock()
+            Debug:Log("[Swing]", shape, "->", tostring(err))
+        end
+    end
+    return false
 end
 
 --// the driver: one LinearVelocity on the HRP, world-space, aimed by us every frame
@@ -1625,8 +1757,15 @@ local function underAttack(titan, seconds)
         if (os.clock() - warnedAt) > 8 then
             warnedAt = os.clock()
             if Debug then
+                --// the titan's own HP is in this line on purpose: it is the one
+                --// number that proves whether a swing is landing damage at all
+                local titanModel = cur:FindFirstAncestorOfClass("Model")
+                local tHum = titanModel and titanModel:FindFirstChildOfClass("Humanoid")
+                local segNow, segMax = bladeSegments()
                 Debug:Log("[Under] lane Y", math.floor(y), "| nape bottom Y", math.floor(reach),
-                    "| nape size", sizeNow, "| blade speed", math.floor(Sweep.speed or 0))
+                    "| nape size", sizeNow, "| blade speed", math.floor(Sweep.speed or 0),
+                    "| titan HP", tHum and math.floor(tHum.Health) or "?",
+                    "| segments", segNow .. "/" .. segMax)
             end
         end
 
@@ -1891,6 +2030,32 @@ end
 --// blade-part snapshot, so the next log gives us the exact broken-blade signature.
 --// Fruitless attempts are counted: after a few we stop and say so, instead of
 --// grinding the blade reserve down for nothing.
+--// THE DURABILITY ORACLE, and it needed no function call at all. The probe's
+--// character dump shows the real blades as INSTANCES:
+--//   Workspace.Characters.<you>.Rig_sebawar.RightHand.Blade_1 .. Blade_7
+--//   Workspace.Characters.<you>.Rig_sebawar.LeftHand.Blade_1  .. Blade_7
+--// Blade segments are parts that exist or do not, so COUNTING them IS the
+--// durability. This is the readable number we spent three probes hunting for, and
+--// it turns auto-reload from a 10-second guess that costs a set into a precise
+--// trigger: if segments are missing, a blade really is broken, right now.
+local BladeODM = { max = 0, lastLogged = -1, at = 0 }
+
+local function bladeSegments()
+    local char = LocalPlayer.Character
+    if not char then return 0, BladeODM.max end
+    local n = 0
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") and d.Name:match("^Blade_%d+$") then n = n + 1 end
+    end
+    if n > BladeODM.max then BladeODM.max = n end
+    if n ~= BladeODM.lastLogged and Debug and (os.clock() - BladeODM.at) > 2 then
+        BladeODM.at = os.clock()
+        BladeODM.lastLogged = n
+        Debug:Log("[Blade] segments", n, "/", BladeODM.max)
+    end
+    return n, BladeODM.max
+end
+
 local function bladeSnapshot()
     local char = LocalPlayer.Character
     if not char then return "no character" end
@@ -1914,32 +2079,42 @@ local function reloadBlades(reason)
     AutoReload.holdUntil = os.clock() + 0.5
     AutoReload.pauseUntil = os.clock() + 0.3
     local before = bladeSnapshot()
+    refreshModules()
+    local host = gameHost()
     local did = false
-    --// (1) the game's own action API — WE KNOW this drives the gear, because
-    --// Input.Action("Slash") is what swings us. Pressed then released, like Slash.
+    --// (1) THE GAME'S OWN RELOAD PATH, now called the way it actually wants to be
+    --// called. Blades.Reload and ODMG.Reload are arity 2 and index their FIRST
+    --// ARGUMENT for .Modules — so the no-argument calls this script made for three
+    --// versions were reaching nothing at all. With the host passed they get their
+    --// Modules, their Effects and their Blades, exactly like a real R press.
+    if host then
+        pcall(function()
+            if type(BladesModule) == "table" and type(BladesModule.Reload) == "function" then
+                BladesModule.Reload(host)
+                did = true
+            end
+        end)
+        pcall(function()
+            if type(ODMGModule) == "table" and type(ODMGModule.Reload) == "function" then
+                ODMGModule.Reload(host)
+                did = true
+            end
+        end)
+    end
+    --// (2) the game's action entry, also with the host first
     if action("Reload", true) then
         did = true
         task.delay(0.15, function() action("Reload", false) end)
     end
-    --// (2) the real R bind: the ONE reload ever observed to work. HELD briefly,
-    --// not tapped, because the gear reads held input. Skipped while you are typing
-    --// so it can never type an "r" into a text box.
+    --// (3) the real R bind, kept as a belt-and-braces fallback (a real R press is
+    --// the one reload confirmed to work by hand). HELD briefly, not tapped, because
+    --// the gear reads held input. Skipped while typing so it can never type an "r".
     if not typing() then
         pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.R, false, game) end)
         task.delay(0.15, function()
             pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game) end)
         end)
     end
-    --// (3) the module entries, kept only as a harmless extra. The probe showed the
-    --// game never goes through them — do not expect anything from these.
-    pcall(function()
-        local ODMG = getgenv().HamasAOT_ODMG
-        if type(ODMG) ~= "table" then
-            ODMG = require(ReplicatedStorage.Modules.Core.ODMG)
-            getgenv().HamasAOT_ODMG = ODMG
-        end
-        if type(ODMG) == "table" and type(ODMG.Reload) == "function" then ODMG.Reload() end
-    end)
     --// the AFTER snapshot, so the log carries the real result of the attempt
     task.delay(0.9, function()
         if Debug then
@@ -1983,7 +2158,18 @@ task.spawn(function()
         --//   * at most once every 20s and at most TWICE per farm session,
         --//   * never when the reserve is empty (reloading cannot help then),
         --//   * and it stops and says so rather than grinding your sets away.
-        if AutoReload.gaveUp then
+        --// v3.16 — THE DURABILITY ORACLE. The blades are instances
+        --// (Rig_*.RightHand.Blade_1..7 / LeftHand.Blade_1..7), so counting them IS
+        --// the durability: no function call, no reserve label, no guess. Missing
+        --// segments means a blade really is broken right now, so this reloads
+        --// immediately instead of waiting 10s — and, more importantly, it can tell
+        --// the difference between "blades are broken" and "blades are fine", which
+        --// is what stops it spending your sets for nothing.
+        local seg, segMax = bladeSegments()
+        if Farm.Enabled and segMax > 0 and seg < segMax and Attack.active then
+            if Debug then Debug:Log("[Blade] broken —", seg, "of", segMax, "segments left") end
+            reloadBlades(("segments %d/%d"):format(seg, segMax))
+        elseif AutoReload.gaveUp then
             --// already stopped and already said why: stay off it
         elseif Farm.Enabled and (have or 0) > 0 and Attack.active
             and (os.clock() - (Trigger.lastContact or 0)) < 1.0 then
@@ -2083,6 +2269,56 @@ getgenv().HamasBladeProbe = function()
     local line = table.concat(out, " | ")
     if Debug then Debug:Log("[BladeProbe]", line) end
     return line
+end
+
+--// HOST-AWARE SWING TEST — the one that should name the working entry.
+--//     getgenv().HamasSwingTest()
+--// Every candidate is called with the HOST as argument one, which is what the
+--// probe's error messages said these functions want. For each it reports whether it
+--// threw, and whether the target titan's HP changed in the next half second. The
+--// entry that drops HP is the real swing; everything else is a no-op and gets
+--// dropped from the script. Run it parked under a titan's nape with Auto Farm on.
+getgenv().HamasSwingTest = function()
+    local host = gameHost()
+    if not host then return "no host (char.Actor.Client.Host.Actor/.Client/.Host)" end
+    local out = { "host=" .. host:GetFullName(), "modules=", GameEnv.src }
+    local function titanHP()
+        local cur = Sweep.titan and napeOf(Sweep.titan)
+        local t = cur and cur:FindFirstAncestorOfClass("Model")
+        local h = t and t:FindFirstChildOfClass("Humanoid")
+        return h and h.Health or nil
+    end
+    local O, M, B = ODMGModule, InputModule, BladesModule
+    local cands = {
+        { "ODMG.M1(host)",            function() return O and O.M1(host) end },
+        { "ODMG.M1(host,true)",       function() return O and O.M1(host, true) end },
+        { "Input.Slash(host)",        function() return M and M.Slash(host) end },
+        { "Input.Slash(host,'Slash')",function() return M and M.Slash(host, "Slash") end },
+        { "Input.Slash(host,true)",   function() return M and M.Slash(host, true) end },
+        { "Input.Action(host,n,t)",   function() return M and M.Action(host, "Slash", true) end },
+        { "Input.Action(host,true)",  function() return M and M.Action(host, true) end },
+        { "Blades.Reload(host)",      function() return B and B.Reload(host) end },
+        { "ODMG.Reload(host)",        function() return O and O.Reload(host) end },
+        { "ODMG.Get_Reload(host)",    function() return O and O.Get_Reload(host) end },
+    }
+    for _, c in ipairs(cands) do
+        local h0 = titanHP()
+        local seg0 = select(1, bladeSegments())
+        local ok, err = pcall(c[2])
+        task.wait(0.5)
+        local h1 = titanHP()
+        local seg1 = select(1, bladeSegments())
+        local line = ("%s -> %s"):format(c[1], ok and "clean" or ("ERR " .. tostring(err)))
+        if h0 and h1 and h0 ~= h1 then line = line .. ("   *** TITAN HP %d -> %d"):format(h0, h1) end
+        if seg1 ~= seg0 then line = line .. ("   blades %d -> %d"):format(seg0, seg1) end
+        out[#out + 1] = line
+        if Debug then Debug:Log("[SwingTest]", line) end
+        task.wait(0.25)
+    end
+    local seg, segMax = bladeSegments()
+    out[#out + 1] = ("segments %d/%d | swing winner so far: %s"):format(seg, segMax, tostring(Swing.winner))
+    if Debug then Debug:Log("[SwingTest]", out[#out + 1]) end
+    return table.concat(out, " || ")
 end
 
 local function needReload()
@@ -2443,7 +2679,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.15 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.16 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.15 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.16 loaded", Duration = 3 })
 end)
