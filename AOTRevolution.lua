@@ -6,6 +6,16 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.25: THE LOG CAUGHT BOTH, LIVE. (1) ":2147: attempt to call a nil value"
+--//        every cycle: bladeSegments() was defined ~330 lines BELOW the [Under]
+--//        logger that calls it — a forward reference to a local that does not
+--//        exist yet, so the 8s report threw and KILLED the attack thread, and
+--//        the farm parked/attacked/parked in a loop (141 error lines in one
+--//        session). Hoisted to the top; the logger is pcall-wrapped too.
+--//        (2) The corpse state is "Humanoid REMOVED", not "Health 0": your log
+--//        shows "[Under] target ... HP ?" for 4-9s per kill. liveTitans()
+--//        treated "no Humanoid" as ALIVE, so corpses were legal targets and
+--//        the lane swept the same place. No-Humanoid = dead, everywhere now.
 --// v3.24: MOVE ON THE INSTANT A TITAN DIES. "It attacks the same place after a
 --//        titan dies." The server's HP update and hitbox removal lag the kill,
 --//        so the corpse still counted as live and got re-picked (or kept the
@@ -975,6 +985,34 @@ end
 --// a nape part and HP>0 client-side, so the farm kept "attacking the same
 --// place". Anything registered here is skipped for 3 seconds, everywhere:
 --// nearestTitan, parkIdle, the farm loop.
+--// v3.25: HOISTED from the reload section. It was defined ~330 lines BELOW the
+--// [Under] logger that calls it, so every 8s report threw
+--// "attempt to call a nil value" and KILLED the attack thread — the farm then
+--// parked, re-entered, parked... the park/attack thrash in the live log (141
+--// error lines in one session). Lua locals do not exist before their line.
+local BladeODM = { max = 0, lastLogged = -1, at = 0 }
+
+local function bladeSegments()
+    local char = LocalPlayer.Character
+    if not char then return 0, BladeODM.max end
+    local n = 0
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") and d.Name:match("^Blade_%d+$") then n = n + 1 end
+    end
+    if n > BladeODM.max then BladeODM.max = n end
+    if n ~= BladeODM.lastLogged and Debug and (os.clock() - BladeODM.at) > 2 then
+        BladeODM.at = os.clock()
+        BladeODM.lastLogged = n
+        Debug:Log("[Blade] segments", n, "/", BladeODM.max)
+    end
+    return n, BladeODM.max
+end
+
+--// v3.24: CORPSE FILTER, shared by every picker. After a kill the server's
+--// Health update and hitbox removal can lag a moment — the dead titan still has
+--// a nape part and HP>0 client-side, so the farm kept "attacking the same
+--// place". Anything registered here is skipped for 3 seconds, everywhere:
+--// nearestTitan, parkIdle, the farm loop.
 local recentDead = {}
 
 local function liveTitans()
@@ -983,8 +1021,12 @@ local function liveTitans()
     local out = {}
     for _, t in ipairs(T:GetChildren()) do
         if napeOf(t) and napeOf(t).Parent then
+            --// v3.25: NO HUMANOID = CORPSE. Your live log proved it: dead titans
+            --// show "[Under] target ... HP ?" for 4-9s while the death animation
+            --// plays, and "not h" counted them as LIVE everywhere — that is the
+            --// same-place sweep. A corpse can never be a target now.
             local h = t:FindFirstChildOfClass("Humanoid")
-            if not h or h.Health > 0 then
+            if h and h.Health > 0 then
                 out[#out + 1] = t
             end
         end
@@ -2109,12 +2151,12 @@ local function underAttack(titan, seconds)
     while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
         local cur = napeOf(titan)
         if not (cur and cur.Parent and hum.Health > 0) then break end
-        --// v3.24: the target is DEAD — leave the instant the server says so,
---//        do not keep sweeping the corpse while the death animation plays
+        --// v3.25: DEAD TARGET, INSTANT EXIT — and a MISSING Humanoid counts as
+        --// dead too (the server despawns it on death; that is the "HP ?" state).
         do
             local tmx = cur:FindFirstAncestorOfClass("Model")
             local thx = tmx and tmx:FindFirstChildOfClass("Humanoid")
-            if thx and thx.Health <= 0 then break end
+            if (not thx or thx.Health <= 0) then break end
         end
 
         --// v3.18 — NEVER RISE INTO THE STOMP. v3.17 climbed you up to meet the nape
@@ -2139,7 +2181,9 @@ local function underAttack(titan, seconds)
         --// the blade speed we are actually achieving
         if (os.clock() - warnedAt) > 8 then
             warnedAt = os.clock()
-            if Debug then
+            --// v3.25: pcall-wrapped. A logger must never be able to kill the
+            --// attack thread again, whatever it throws.
+            pcall(function()
                 --// the titan's own HP is in this line on purpose: it is the one
                 --// number that proves whether a swing is landing damage at all
                 local titanModel = cur:FindFirstAncestorOfClass("Model")
@@ -2152,7 +2196,7 @@ local function underAttack(titan, seconds)
                     "| nape size", sizeNow, "| blade speed", math.floor(Sweep.speed or 0),
                     "| titan HP", tHum and math.floor(tHum.Health) or "?",
                     "| segments", segNow .. "/" .. segMax)
-            end
+            end)
         end
 
         --// a synthesized touch pair every frame on top of the real overlap
@@ -2232,11 +2276,11 @@ local function passTitan(titan, seconds)
     local t0 = os.clock()
     while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
         if not (np.Parent and hum.Health > 0) then break end
-        --// v3.24: same dead-target exit for pass mode
+        --// v3.25: same dead-target exit for pass mode, missing Humanoid counts
         do
             local tmx = np:FindFirstAncestorOfClass("Model")
             local thx = tmx and tmx:FindFirstChildOfClass("Humanoid")
-            if thx and thx.Health <= 0 then break end
+            if (not thx or thx.Health <= 0) then break end
         end
         if Farm.Mode == "still" then
             --// "still" mode (debug only): sit exactly on the nape and swing.
@@ -2474,23 +2518,8 @@ end
 --// durability. This is the readable number we spent three probes hunting for, and
 --// it turns auto-reload from a 10-second guess that costs a set into a precise
 --// trigger: if segments are missing, a blade really is broken, right now.
-local BladeODM = { max = 0, lastLogged = -1, at = 0 }
-
-local function bladeSegments()
-    local char = LocalPlayer.Character
-    if not char then return 0, BladeODM.max end
-    local n = 0
-    for _, d in ipairs(char:GetDescendants()) do
-        if d:IsA("BasePart") and d.Name:match("^Blade_%d+$") then n = n + 1 end
-    end
-    if n > BladeODM.max then BladeODM.max = n end
-    if n ~= BladeODM.lastLogged and Debug and (os.clock() - BladeODM.at) > 2 then
-        BladeODM.at = os.clock()
-        BladeODM.lastLogged = n
-        Debug:Log("[Blade] segments", n, "/", BladeODM.max)
-    end
-    return n, BladeODM.max
-end
+--// (bladeSegments + BladeODM moved to the top of the file, v3.25 — see the
+--// note there. Definition order killed the attack thread every 8 seconds.)
 
 local function bladeSnapshot()
     local char = LocalPlayer.Character
@@ -3236,7 +3265,7 @@ end
 --// on, then the saved config put it straight back to false.
 task.delay(3, function() tryResume(1) end)
 
-print("[Hamas] AOT Revolution v3.24 loaded, place:", game.PlaceId)
+print("[Hamas] AOT Revolution v3.25 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.24 loaded", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "AOT Revolution v3.25 loaded", Duration = 3 })
 end)
