@@ -6,6 +6,15 @@
 --//        nape auto-scaled to your blade hitbox, parallel multi-titan sweep,
 --//        deeper park (depth slider, clamped above FallenPartsDestroyHeight),
 --//        ODMG M1 booster, killfloor scan fix, lobby teleport bypass.
+--// v3.2: FIXES — the master toggle is the ONLY switch (no more autostart from a
+--//        stale flag file), auto-teleport into AOT/mission whenever the lobby
+--//        stalls or you're sitting in the wrong game, killfloor re-scanned per
+--//        mission, park self-heals if the server moves you, and an optional
+--//        "resume after server hop" that visibly turns the toggle back on.
+--//        ALSO: the v3.1 firetouchinterest-only kill deals ZERO damage in the
+--//        current build (measured live), so the farm now drives the blade
+--//        volume through the nape and swings for real, retreating under the
+--//        map whenever a titan gets hold of the player.
 
 
 --// loadstring entry (works from Synapse workspace AND raw GitHub):
@@ -24,7 +33,7 @@ if getgenv().HamasAOT_Shutdown then pcall(getgenv().HamasAOT_Shutdown) end
 
 local ctx = Base:Create({
     GameName = "AOT Revolution",
-    Version = "3.1",
+    Version = "3.2",
     Debug = true,
     Tabs = {
         { Title = "Farming",  Icon = "wheat" },
@@ -34,6 +43,11 @@ local ctx = Base:Create({
     },
 })
 local Fluent, Window, Tabs, Debug, SaveManager = ctx.Fluent, ctx.Window, ctx.Tabs, ctx.Debug, ctx.SaveManager
+
+--// saving/loading: every element in this script is registered with Fluent, so
+--// SaveManager picks up all of them. The Auto Farm master switch is the one
+--// exception — it must never come back on by itself.
+pcall(function() SaveManager:SetIgnoreIndexes({ "AOT_FarmMaster" }) end)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -285,45 +299,164 @@ local function findClosestGasTank()
     return nil
 end
 
+--// Robust distance-proof teleport: a single huge CFrame jump gets rejected or
+--// snapped back when you are far out, so walk the character there in steps and
+--// verify the landing. Works from any distance in the map.
+local function teleportTo(target, opts)
+    opts = opts or {}
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hrp and target) then return false, "no character" end
+    local goal = target + (opts.offset or Vector3.new(0, 3, 0))
+    hrp.Anchored = false
+    for _ = 1, (opts.attempts or 5) do
+        local start = hrp.Position
+        local total = (goal - start).Magnitude
+        if total < 15 then break end
+        local steps = math.max(1, math.ceil(total / (opts.step or 120)))
+        for i = 1, steps do
+            if not hrp.Parent then return false, "character died" end
+            hrp.CFrame = CFrame.new(start:Lerp(goal, i / steps))
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            task.wait(steps > 1 and 0.04 or 0.12)
+        end
+        task.wait(0.15)
+        if hrp.Parent and (hrp.Position - goal).Magnitude < 15 then return true end
+    end
+    task.wait(0.1)
+    return hrp.Parent ~= nil and (hrp.Position - goal).Magnitude < 15, "snapped back"
+end
+
+--// closest blade supply (gas tank / cannister) — no distance limit at all, and
+--// the game's own position sync is told about it so its check agrees with us
+local function findClosestSupply()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local best, bestPos, bestD
+    local function consider(inst)
+        local pos
+        if inst:IsA("Model") then
+            local ok, cf = pcall(inst.GetPivot, inst)
+            if not ok then return end
+            pos = cf.Position
+        elseif inst:IsA("BasePart") then
+            pos = inst.Position
+        else
+            return
+        end
+        local d = (pos - hrp.Position).Magnitude
+        if not bestD or d < bestD then best, bestPos, bestD = inst, pos, d end
+    end
+    local function scan(root)
+        if not root then return end
+        for _, d in ipairs(root:GetDescendants()) do
+            local n = d.Name
+            if (n == "GasTank" or n:find("Cannister") or n:find("Canister")) and not d:IsDescendantOf(char) then
+                consider(d)
+            end
+        end
+    end
+    scan(workspace:FindFirstChild("Unclimbable"))
+    if not best then scan(workspace) end
+    if best then return best, bestPos, bestD end
+    return nil
+end
+
+local function teleportToClosestBlades()
+    local supply, pos, dist = findClosestSupply()
+    if not supply then return false, "no blade supply in this map", nil end
+    local ok, err = teleportTo(pos)
+    local rem = ReplicatedStorage:FindFirstChild("Assets")
+    rem = rem and rem:FindFirstChild("Remotes")
+    local POST = rem and rem:FindFirstChild("POST")
+    if POST then pcall(function() POST:FireServer(pos) end) end
+    return ok, err, dist
+end
+
 --// ===========================================================================
---// AUTO FARM v3 — OP mode
+--// AUTO FARM v3.2 — OP mode
 --//
---// How it kills: firetouchinterest(nape, ourHitbox, 0/1) bursts — this synthesizes
---// the EXACT Touched event the server validates for blade damage (combat is
---// physical; there is no hit remote). No clicks, no swings, no movement needed.
---// Nape is auto-expanded per titan so the volume is huge; the touch burst lands
---// dozens of damage events per second per titan.
---// Where you sit: parked deep UNDER THE MAP at (nape.X, KillFloorY - 50, nape.Z),
---// anchored. Untouchable — grabs/detect volumes never reach that far down.
+--// How it kills: the farm drives the blade volume (character.Hitbox) through
+--// each titan's Hitboxes/Hit/Nape every frame, fires a synthesized touch pair
+--// for good measure, and sends the game's own swing (input action + a real
+--// left click). Blade damage in this build is validated on the server from an
+--// actual swing, so touch tricks alone are not enough — measured live: 0
+--// damage from firetouchinterest bursts, contact, ODMG.M1 and Input.Slash
+--// without the swing. You never click; the farm does.
+--// Where you sit: ON the nape while killing, and parked deep UNDER THE MAP
+--// (nape.X, KillFloorY - ParkDepth, nape.Z) whenever you are hurt, waiting, or
+--// between rounds — that deep spot is untouchable, grabs never reach it.
 --// ===========================================================================
 local Farm = {
     Enabled = false,
     GasThreshold = 15,
     BurstSize = 40,          -- touch events per wave (per titan, all titans in parallel)
     BurstDelay = 0.02,       -- seconds between touch events (50/s)
-    WavesPerTitan = 4,       -- waves per sweep pass before the loop re-scans
+    WavesPerTitan = 4,       -- titans to work through per sweep before re-scanning
+    Dwell = 1.5,             -- seconds spent driving the blade through one titan
+    SwingDelay = 0.2,        -- minimum seconds between swings
+    UseInputSwing = true,    -- also send a real left click (some builds need it)
+    RetreatHP = 35,          -- below this HP the farm stops attacking for a moment
+    RetreatTime = 1.5,       -- seconds of backing off when hurt
+    PanicPark = false,       -- OFF: never teleport you under the map mid-mission
     ParkDepth = 150,         -- studs BELOW the map's killfloor we park
     BladeFactor = 1.5,       -- nape auto-size = blade hitbox max dimension * this
     NapeSize = 60,           -- fallback; overridden by blade auto-size while farming
     state = "IDLE",
     autoNape = false,
     reloadCooldownUntil = 0,
-    lastTeleportAttempt = 0,
+    lastHop = -1e6,            -- throttle for cross-place teleports
+    emptySince = nil,          -- os.clock() when we first saw zero titans
+    killFloorAt = 0,           -- os.clock() of the last killfloor scan
+    sawAOT = false,            -- latch: once we spot AOT content, never hop out
+    sawTitans = false,         -- latch: we have fought in THIS server
+    resumeAfterHop = true,     -- re-arm the farm after OUR OWN server hop
+    flagAt = 0,                -- last refresh of the resume marker
     kills = 0,
+}
+
+--// the only places the farm drives itself to
+local LOBBY_PLACE_ID = 13379208636
+local MISSION_PLACE_ID = 13379349730
+local AOT_PLACES = {
+    [13379208636] = true,   -- lobby / HQ
+    [13379349730] = true,   -- missions
+    [14638336319] = true,   -- missions (2nd id)
 }
 
 local FARM_FLAG = "HamasAOT_FarmEnabled.txt"
 
+local FARM_FLAG_TTL = 120 -- seconds: only a hop WE just caused may re-arm the farm
+
 local function setFarmFlag(v)
     pcall(function()
-        if v then writefile(FARM_FLAG, "1") else
+        if v then writefile(FARM_FLAG, tostring(os.time())) else
             if isfile(FARM_FLAG) then delfile(FARM_FLAG) end
         end
     end)
 end
-local function readFarmFlag()
-    local ok, v = pcall(function() return isfile(FARM_FLAG) end)
-    return ok and v or false
+
+-- age (seconds) of the persisted "farm was on" marker, or nil if there is none.
+-- A marker older than FARM_FLAG_TTL is ignored AND deleted: the farm must never
+-- switch itself on just because an old session left a file behind.
+local function farmFlagAge()
+    local ok, content = pcall(function()
+        if isfile(FARM_FLAG) then return readfile(FARM_FLAG) end
+        return nil
+    end)
+    if not ok or not content then return nil end
+    local stamp = tonumber(content:match("%-?%d+"))
+    if not stamp then -- legacy flag (plain "1") = no timestamp = stale
+        pcall(function() delfile(FARM_FLAG) end)
+        return nil
+    end
+    local age = os.time() - stamp
+    if age < 0 or age > FARM_FLAG_TTL then
+        pcall(function() delfile(FARM_FLAG) end)
+        return nil
+    end
+    return age
 end
 
 --// --- generic inset-corrected VIM click on any GuiButton (proven on the Retry button)
@@ -391,6 +524,39 @@ local function pressPlayStart()
     return false, "no start button"
 end
 
+--// --- are we even inside AOT? place id first, then content fingerprints
+local function isAOTPlace()
+    if Farm.sawAOT then return true end
+    if AOT_PLACES[game.PlaceId] then Farm.sawAOT = true return true end
+    if workspace:FindFirstChild("Titans") then Farm.sawAOT = true return true end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local iface = pg and pg:FindFirstChild("Interface")
+    if iface and iface:FindFirstChild("Title_Screen") then Farm.sawAOT = true return true end
+    local core = ReplicatedStorage:FindFirstChild("Modules")
+    core = core and core:FindFirstChild("Core")
+    if core and core:FindFirstChild("ODMG") then Farm.sawAOT = true return true end
+    return false
+end
+
+--// --- cross-place hop (client-side Teleport is allowed for the LocalPlayer)
+local HOP_COOLDOWN = 15
+local function hopToPlace(placeId, reason, force)
+    local now = os.clock()
+    if not force and (now - (Farm.lastHop or 0)) < HOP_COOLDOWN then return false, "cooldown" end
+    Farm.lastHop = now
+    if Farm.Enabled then setFarmFlag(true) end -- re-arm in the new server
+    if Debug then Debug:Log("[Farm] TELEPORT ->", placeId, reason or "") end
+    Fluent:Notify({ Title = "HamasClient", Content = "Teleporting to AOT (" .. placeId .. ")...", Duration = 3 })
+    local ok, err = pcall(function()
+        game:GetService("TeleportService"):Teleport(placeId, LocalPlayer)
+    end)
+    if not ok then
+        if Debug then Debug:Log("[Farm] teleport failed:", tostring(err)) end
+        Fluent:Notify({ Title = "HamasClient", Content = "Teleport failed: " .. tostring(err), Duration = 4 })
+    end
+    return ok
+end
+
 --// --- titan helpers
 local function napeOf(titan)
     local hb = titan and titan:FindFirstChild("Hitboxes")
@@ -447,6 +613,7 @@ local function computeKillFloor()
         end
     end
     killFloorY = (minY ~= math.huge and minY or 0) - 30
+    Farm.killFloorAt = os.clock()
     return killFloorY
 end
 
@@ -465,6 +632,15 @@ local function parkUnderPoint(x, z)
     if not hrp then return end
     hrp.Anchored = true
     hrp.CFrame = CFrame.new(x, parkY(), z)
+end
+
+--// the map is rebuilt every mission and we used to scan it once from the lobby,
+--// so the park height could land in the wrong place. Re-scan while a match runs.
+local function ensureKillFloor(force)
+    if force or (os.clock() - (Farm.killFloorAt or 0) > 5) then
+        computeKillFloor()
+        if Debug then Debug:Log("[Farm] killfloor", math.floor(killFloorY), "-> park Y", math.floor(parkY())) end
+    end
 end
 
 --// nape auto-size: scale the nape volume to OUR blade hitbox, so the sweet
@@ -501,63 +677,115 @@ local function tryM1Booster()
     end)
 end
 
+--// v3.2 attack: the FTI-only burst proved dead in this build (0 damage in a
+--// live 20-titan mission), so the farm now layers EVERY path that can land a
+--// blade hit, cheapest first, and only then falls back to the deep park:
+--//   1. the blade volume is physically driven through the nape (real contact)
+--//   2. a synthesized touch pair (free, works on some builds)
+--//   3. the game's own swing (input pipeline + a real left click)
+local swingRefs = {}
+pcall(function()
+    local Input = require(ReplicatedStorage.Modules.Core.Input)
+    if type(Input) == "table" then
+        if type(Input.Slash) == "function" then
+            swingRefs[#swingRefs + 1] = function() Input.Slash() end
+        end
+        if type(Input.Action) == "function" then
+            swingRefs[#swingRefs + 1] = function() Input.Action("M1") end
+        end
+    end
+end)
+
+local lastSwing = 0
+local function swing()
+    if os.clock() - lastSwing < Farm.SwingDelay then return end
+    lastSwing = os.clock()
+    for _, f in ipairs(swingRefs) do pcall(f) end
+    if not Farm.UseInputSwing then return end
+    local cam = workspace.CurrentCamera
+    local vp = (cam and cam.ViewportSize) or Vector2.new(800, 600)
+    local cx, cy = vp.X / 2, vp.Y / 2
+    pcall(function()
+        VIM:SendMouseMoveEvent(cx, cy, game)
+        VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
+        task.wait(0.04)
+        VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
+    end)
+end
+
+--// drive the blade volume through one titan's nape for `seconds`
+local function attackTitan(titan, seconds)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hb = char and char:FindFirstChild("Hitbox")
+    if not (hum and hrp and hb) then return false end
+    local np = napeOf(titan)
+    if not np then return false end
+    if hrp.Anchored then hrp.Anchored = false end
+    local t0 = os.clock()
+    while Attack.active and Farm.Enabled and (os.clock() - t0) < seconds do
+        local cur = napeOf(titan) or np
+        if not (cur.Parent and hum.Health > 0) then break end
+        hrp.CFrame = CFrame.new(cur.Position) -- blade volume ON the nape
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        for _ = 1, Farm.BurstSize do
+            if not Attack.active then break end
+            pcall(function()
+                firetouchinterest(cur, hb, 0)
+                firetouchinterest(cur, hb, 1)
+            end)
+            task.wait(Farm.BurstDelay)
+        end
+        swing()
+        task.wait(0.05)
+    end
+    return true
+end
+
 local function killSweep()
     local char = LocalPlayer.Character
-    local hb = char and char:FindFirstChild("Hitbox")
-    if not (hb and firetouchinterest) then return false end
-    local titans = liveTitans()
-    if #titans == 0 then return false end
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (char and hum) then return false end
+    if #liveTitans() == 0 then return false end
 
-    -- park once, under the nearest titan's XZ, deep below everything
-    local target = nearestTitan()
-    local np = target and napeOf(target)
-    if np then parkUnderPoint(np.Position.X, np.Position.Z) end
+    ensureKillFloor()
     Attack.active = true
 
-    local counted = {}
-    for wave = 1, Farm.WavesPerTitan do
+    for _ = 1, Farm.WavesPerTitan do
         if not (Attack.active and Farm.Enabled) then break end
         local alive = liveTitans()
         if #alive == 0 then break end
 
-        -- FTI burst: touch + untouch EVERY live nape with our blade hitbox.
-        -- No clicks, no swings, no aiming — everyone dies in parallel.
-        for i = 1, Farm.BurstSize do
-            if not Attack.active then break end
-            for _, titan in ipairs(alive) do
-                local n2 = napeOf(titan)
-                if n2 and n2.Parent then
-                    pcall(function()
-                        firetouchinterest(n2, hb, 0)  -- touch start
-                        firetouchinterest(n2, hb, 1)  -- touch end (same frame pair = clean hit)
-                    end)
-                end
+        --// hurt? back off for a moment. We do NOT move you: diving under the
+        --// map mid-mission is what made the farm look broken. Only the panic
+        --// park toggle (off by default) is allowed to do that.
+        if hum.Health <= Farm.RetreatHP then
+            Farm.state = "RETREAT"
+            if Farm.PanicPark then
+                local t = nearestTitan()
+                local np = t and napeOf(t)
+                if np then parkUnderPoint(np.Position.X, np.Position.Z) end
             end
-            task.wait(Farm.BurstDelay)
+            local untilT = os.clock() + Farm.RetreatTime
+            while os.clock() < untilT and Attack.active and Farm.Enabled do task.wait(0.2) end
+            Farm.state = "KILLING"
         end
 
-        task.wait(0.2) -- let the server digest the hits
-
-        -- score the wave
-        for _, t in ipairs(titans) do
-            if not counted[t] then
-                local gone = not t.Parent
-                local dead = false
-                if t.Parent then
-                    local h = t:FindFirstChildOfClass("Humanoid")
-                    dead = (h and h.Health <= 0) or false
-                end
-                if gone or dead then
-                    counted[t] = true
-                    Farm.kills = Farm.kills + 1
-                end
-            end
-        end
-
-        if #liveTitans() > 0 then tryM1Booster() else break end
+        local target = nearestTitan()
+        if not target then break end
+        local before = #alive
+        attackTitan(target, Farm.Dwell)
+        local killed = before - #liveTitans()
+        if killed > 0 then Farm.kills = Farm.kills + killed end
+        tryM1Booster()
     end
 
     Attack.active = false
+    --// never leave the player anchored to the map between sweeps
+    local c2 = LocalPlayer.Character
+    local h2 = c2 and c2:FindFirstChild("HumanoidRootPart")
+    if h2 and h2.Anchored then h2.Anchored = false end
     return true
 end
 
@@ -632,44 +860,75 @@ task.spawn(function()
             if #titans == 0 then
                 Farm.state = "ROUND_END"
                 stopAttack()
-                task.wait(2)
-                local ok, msg = clickRetry()
-                if not ok and inLobby() then
+                Farm.emptySince = Farm.emptySince or os.clock()
+
+                --// not in AOT at all (or still loading)? get me into the game.
+                --// Grace wait first so a loading server isn't read as "wrong game".
+                if not (game:IsLoaded() and isAOTPlace()) then
+                    task.wait(2.5)
+                    if not isAOTPlace() then
+                        Farm.state = "HOP_LOBBY"
+                        hopToPlace(LOBBY_PLACE_ID, "not in AOT (place " .. tostring(game.PlaceId) .. ")")
+                        task.wait(6)
+                        continue
+                    end
+                end
+
+                local ok, msg
+                local lobby = inLobby()
+
+                if lobby then
+                    --// 1) lobby / title screen: PLAY then START, then get me into
+                    --// a match even if that START button is the dead decoy again
                     Farm.state = "LOBBY"
                     local ok2, msg2 = pressPlayStart()
                     if Debug then Debug:Log("[Farm] lobby start:", ok2 and "clicked" or tostring(msg2)) end
-                    if ok2 then task.wait(5) end
-                    --// the START button never launches (game-side quirk) — bypass
-                    --// the whole UI with a direct client teleport to the mission place
-                    if inLobby() and os.clock() - Farm.lastTeleportAttempt > 45 then
-                        Farm.lastTeleportAttempt = os.clock()
-                        Farm.state = "TELEPORT"
-                        if Debug then Debug:Log("[Farm] lobby start failed — direct teleport to mission place") end
-                        Fluent:Notify({ Title = "HamasClient", Content = "Lobby stuck — teleporting to mission...", Duration = 2 })
-                        pcall(function()
-                            game:GetService("TeleportService"):Teleport(13379349730, LocalPlayer)
-                        end)
-                        task.wait(5)
+                    for _ = 1, 12 do
+                        task.wait(0.5)
+                        if #liveTitans() > 0 then break end
                     end
-                elseif Debug and not ok then
-                    Debug:Log("[Farm] retry:", msg)
-                end
-                stopAttack()
-                for _ = 1, 40 do
+                else
+                    --// 2) in a mission: the proven retry click = hop to the next one
                     task.wait(1)
-                    if #liveTitans() > 0 then break end
+                    setFarmFlag(true) -- the marker must be fresh when the hop lands
+                    ok, msg = clickRetry()
+                    if not ok and Debug then Debug:Log("[Farm] retry:", msg) end
+                    for _ = 1, 24 do
+                        task.wait(0.5)
+                        if #liveTitans() > 0 then break end
+                    end
                 end
+                if #liveTitans() > 0 then Farm.emptySince = nil continue end
+
+                --// 3) nothing launched: bypass the whole UI and hop into the
+                --// mission place. The marker file re-arms the farm over there.
+                --// If we already fought here, give the server a long grace first
+                --// so a slow round transition never costs us a live match.
+                local grace = Farm.sawTitans and 45 or 8
+                if lobby or ok or (os.clock() - Farm.emptySince > grace) then
+                    Farm.state = "HOP_MISSION"
+                    local hopReason = lobby and "lobby start never launched" or "no mission for a while"
+                    if hopToPlace(MISSION_PLACE_ID, hopReason) then
+                        if Debug then Debug:Log("[Farm]", hopReason .. " — hopped to mission place") end
+                        task.wait(6)
+                        Farm.emptySince = nil
+                        continue
+                    end
+                end
+                task.wait(1)
             else
+                Farm.emptySince = nil
+                Farm.sawTitans = true -- we fought here; don't hop on a slow wave change
+                --// keep the resume marker fresh while a match is actually running
+                if os.clock() - (Farm.flagAt or 0) > 60 then
+                    Farm.flagAt = os.clock()
+                    setFarmFlag(true)
+                end
                 local need = needReload()
                 if need == "gas" then
                     Farm.state = "RELOADING"
-                    local tank, pos = findClosestGasTank()
-                    local hrp = char:FindFirstChild("HumanoidRootPart")
-                    if tank and hrp then
-                        hrp.Anchored = false
-                        hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
-                        task.wait(0.5)
-                    end
+                    teleportToClosestBlades() -- works from any distance
+                    task.wait(0.5)
                     doReload()
                 elseif need == "blades" then
                     Farm.state = "RELOADING"
@@ -701,7 +960,7 @@ local function setFarm(v)
         end
         autoBladeNape() -- nape size matches the blade hitbox
         Farm.state = "FARMING"
-        computeKillFloor()
+        ensureKillFloor(true)
     else
         stopAttack()
         if Farm.autoNape then
@@ -715,24 +974,48 @@ local function setFarm(v)
     Fluent:Notify({ Title = "HamasClient", Content = Farm.Enabled and "Auto farm ON — OP touch-kill mode" or "Auto farm OFF", Duration = 2 })
 end
 getgenv().HamasAOT_Farm = Farm
-getgenv().HamasAOT_FarmSet = setFarm
-
--- resume automatically after the retry server-hop re-executes the script
-if readFarmFlag() and not Farm.Enabled then
-    task.delay(3, function() setFarm(true) end)
+getgenv().HamasAOT_FarmSet = setFarm   -- getgenv().HamasAOT_FarmSet(true|false)
+getgenv().HamasAOT_FarmStatus = function()
+    return {
+        enabled = Farm.Enabled, state = Farm.state, kills = Farm.kills,
+        titans = #liveTitans(), place = game.PlaceId, lobby = inLobby(),
+        aot = isAOTPlace(), parkY = math.floor(parkY()), nape = Nape.Size,
+    }
 end
+
+-- ===========================================================================
+-- Resume rule: the farm NEVER switches itself on. The only automatic path is
+-- right after a server hop the farm itself caused (a marker written seconds
+-- ago), and even then it flips the REAL toggle so what you see is what runs.
+-- Wired at the end of the file, once the toggle exists.
+-- ===========================================================================
 
 --// ===========================================================================
 --// UI
 --// ===========================================================================
 local F = Tabs.Farming
 F:CreateSection("Auto Farm (Missions) — OP mode")
-F:CreateToggle("AOT_FarmMaster", { Title = "Auto Farm", Description = "Touch-kill all titans -> auto-retry", Default = false,
+local FarmToggle = F:CreateToggle("AOT_FarmMaster", { Title = "Auto Farm", Description = "Touch-kill all titans -> auto-retry", Default = false,
     Callback = setFarm })
+F:CreateToggle("AOT_FarmResume", { Title = "Resume after server hop", Description = "Turn the Auto Farm toggle back on after the farm itself hops servers", Default = true,
+    Callback = function(v) Farm.resumeAfterHop = v end })
 F:CreateSlider("AOT_FarmBurst", { Title = "Touch burst size", Default = 30, Min = 10, Max = 60, Rounding = 0,
     Callback = function(v) Farm.BurstSize = v end })
-F:CreateSlider("AOT_FarmWaves", { Title = "Waves per sweep", Default = 4, Min = 2, Max = 12, Rounding = 0,
+F:CreateSlider("AOT_FarmWaves", { Title = "Titans per sweep", Default = 4, Min = 2, Max = 12, Rounding = 0,
     Callback = function(v) Farm.WavesPerTitan = v end })
+F:CreateSlider("AOT_FarmDwell", { Title = "Seconds on each titan", Default = 1.5, Min = 0.5, Max = 4, Rounding = 1,
+    Callback = function(v) Farm.Dwell = v end })
+F:CreateSlider("AOT_FarmSwing", { Title = "Swing interval (s)", Default = 0.2, Min = 0.05, Max = 0.6, Rounding = 2,
+    Callback = function(v) Farm.SwingDelay = v end })
+F:CreateSlider("AOT_FarmRetreat", { Title = "Back off below HP %", Default = 35, Min = 0, Max = 80, Rounding = 0,
+    Description = "Pauses the attack for a moment while you are hurt (does not move you)",
+    Callback = function(v) Farm.RetreatHP = v end })
+F:CreateToggle("AOT_FarmPanicPark", { Title = "Dive under the map when hurt", Default = false,
+    Description = "Off by default — leave it off unless you want to hide under the map",
+    Callback = function(v) Farm.PanicPark = v end })
+F:CreateToggle("AOT_FarmSwingInput", { Title = "Send left clicks with the kill", Default = true,
+    Description = "Blade damage is validated on a real swing, so the farm clicks for you",
+    Callback = function(v) Farm.UseInputSwing = v end })
 F:CreateSlider("AOT_FarmDepth", { Title = "Park depth below map (studs)", Description = "Deeper = safer; auto-clamped above the void-kill height", Default = 150, Min = 50, Max = 300, Rounding = 0,
     Callback = function(v) Farm.ParkDepth = v end })
 F:CreateSlider("AOT_FarmDelay", { Title = "Touch delay (lower = faster)", Default = 0.02, Min = 0.01, Max = 0.1, Rounding = 2,
@@ -774,38 +1057,28 @@ C:CreateToggle("AOT_AntiEat", { Title = "Auto Struggle (anti-eat)", Default = fa
 
 local TP = Tabs.Teleport
 TP:CreateSection("Locations")
-TP:CreateButton({ Title = "Teleport to closest Gas Tank",
-    Description = "Refills blades — works in lobby HQ and matches",
+TP:CreateButton({ Title = "Teleport to closest blades",
+    Description = "Blade / gas supply — always teleports, no distance limit",
     Callback = function()
-        local tank, pos, dist = findClosestGasTank()
-        if not tank then
-            Fluent:Notify({ Title = "HamasClient", Content = "No gas tanks found anywhere", Duration = 3 })
-            if Debug then Debug:Log("[TP] no GasTank models in workspace") end
-            return
+        Fluent:Notify({ Title = "HamasClient", Content = "Teleporting to the closest blade supply...", Duration = 2 })
+        local ok, err, dist = teleportToClosestBlades()
+        if not ok then
+            Fluent:Notify({ Title = "HamasClient", Content = "Blade teleport: " .. tostring(err), Duration = 3 })
+        else
+            Fluent:Notify({ Title = "HamasClient", Content = "At the blades" .. (dist and string.format(" (%dm)", math.floor(dist + 0.5)) or ""), Duration = 2 })
         end
-        local char = LocalPlayer.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local target = pos + Vector3.new(0, 3, 0)
-            hrp.CFrame = CFrame.new(target)
-            local rem = ReplicatedStorage:FindFirstChild("Assets") and ReplicatedStorage.Assets:FindFirstChild("Remotes")
-            local POST = rem and rem:FindFirstChild("POST")
-            if POST then
-                local ok = pcall(function() POST:FireServer(target) end)
-                if Debug then Debug:Log("[TP] POST sync:", ok and "ok" or "failed") end
-            end
-            Fluent:Notify({ Title = "HamasClient", Content = string.format("Teleported to gas tank (%dm)", math.floor(dist + 0.5)), Duration = 2 })
-            if Debug then Debug:Log("[TP] gas tank @", tank:GetFullName(), string.format("%.0fm", dist)) end
-        end
+        if Debug then Debug:Log("[TP] blades:", tostring(ok), tostring(err), dist and string.format("%.0fm", dist) or "") end
     end })
+TP:CreateButton({ Title = "Teleport to AOT Mission",
+    Description = "Straight into the mission place — same hop the farm uses when the lobby stalls",
+    Callback = function() hopToPlace(MISSION_PLACE_ID, "manual", true) end })
+TP:CreateButton({ Title = "Teleport to AOT Lobby (HQ)",
+    Description = "Back to the lobby / HQ place",
+    Callback = function() hopToPlace(LOBBY_PLACE_ID, "manual", true) end })
 getgenv().HamasAOT_TeleportGas = function()
-    local tank, pos, dist = findClosestGasTank()
-    if not tank then return "no tank" end
-    local char = LocalPlayer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return "no hrp" end
-    hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
-    return string.format("tp %.0fm", dist)
+    local ok, err, dist = teleportToClosestBlades()
+    if not ok then return "failed: " .. tostring(err) end
+    return string.format("tp %.0fm", dist or 0)
 end
 
 local P = Tabs.Combat
@@ -833,4 +1106,19 @@ getgenv().HamasAOT_Shutdown = function()
     stopAttack()
 end
 
-print("[Hamas] AOT Revolution v3.1 loaded, place:", game.PlaceId)
+--// ===========================================================================
+--// post-hop resume — only through the real toggle, only for a fresh marker
+--// ===========================================================================
+local function tryResume(attempt)
+    if not Farm.resumeAfterHop then return end
+    if not farmFlagAge() then return end -- stale/none = stay OFF
+    if not (game:IsLoaded() and isAOTPlace()) then
+        if attempt < 6 then task.delay(2, function() tryResume(attempt + 1) end) end
+        return
+    end
+    if Debug then Debug:Log("[Farm] fresh resume marker — switching the Auto Farm toggle on") end
+    pcall(function() FarmToggle:SetValue(true) end)
+end
+tryResume(1)
+
+print("[Hamas] AOT Revolution v3.2 loaded, place:", game.PlaceId)

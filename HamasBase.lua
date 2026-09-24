@@ -198,6 +198,15 @@ function Base:Create(cfg)
         Tabs.Settings = Window:CreateTab({ Title = "Settings", Icon = "settings" })
     end
     SaveManager:BuildConfigSection(Tabs.Settings)
+    getgenv().HamasSaveManager = SaveManager -- handy for scripts + testing
+
+    --// auto-load: the game script creates its own tabs/toggles right after this
+    --// returns, so wait a beat before restoring or nothing is registered yet.
+    task.delay(2, function()
+        local okA, errA = pcall(function() SaveManager:LoadAutoloadConfig() end)
+        if not okA and Debug then Debug:Log("[Config] autoload failed:", tostring(errA)) end
+    end)
+
     Window:SelectTab(1)
 
     return {
