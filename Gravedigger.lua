@@ -505,6 +505,7 @@ end
 
 --// hunt for the LIVE copy: the one whose base + int equals the real WalkSpeed
 local function findLiveState(ws)
+    if not ws or ws <= 0 then return nil end
     local seen = {}
     local gc = getgc(true)
     for idx = 1, #gc do                      -- index loop: getgc() has holes
@@ -567,6 +568,7 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
 
     if hum.Health <= 0 then
         Sprint.gdState = nil --// dead: this life's table is about to go stale
+        Sprint.RestInt = nil --// and the resting int belongs to that life
         return
     end
 
@@ -604,6 +606,13 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
         end
         if not Sprint.ShiftDown and mod ~= nil then Sprint.RestMod = mod end
 
+        --// the game's own resting int_speed (0 on every reading). We hand it back
+        --// when we stop writing, so a removed ramp never leaks into walking speed.
+        --// Tracked as a minimum so a frame caught mid-decay cannot poison it.
+        if not Sprint.ShiftDown and (not Sprint.lastWrite or now - Sprint.lastWrite > 0.6) then
+            Sprint.RestInt = math.min(Sprint.RestInt or int, int)
+        end
+
         if Sprint.TopInt == nil or int > Sprint.TopInt + 0.01 then
             Sprint.TopInt, Sprint.TopAt = int, now
             if int > (Sprint.loggedTop or 0) + 0.5 then
@@ -611,6 +620,14 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
                 sLog(("sprint top: int_speed %.2f (WalkSpeed %.1f)"):format(int, ws))
             end
         end
+    end
+
+    --// if we were writing until a moment ago and no longer are (Shift released,
+    --// chat focused, sprint blocked), hand the game's resting value back: the game
+    --// does not always rewrite int_speed when its own sprint state never engaged,
+    --// and leaving our value behind would look like a permanent speed boost
+    if st and Sprint.RestInt ~= nil and Sprint.lastWrite and (now - Sprint.lastWrite) < 0.6 then
+        pcall(rawset, st, "int_speed", Sprint.RestInt)
     end
 
     --// only act on a top that has settled — acting mid-ramp is what used to cap
@@ -641,16 +658,18 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
         return
     end
     Sprint.Writes = Sprint.Writes + 1
+    Sprint.lastWrite = now
     if Sprint.Writes == 1 or Sprint.Writes % 240 == 0 then
         sLog(("no-accel: int_speed %.2f + base %.1f = %.1f st/s — your own top, no ramp")
             :format(Sprint.TopInt, base, base + Sprint.TopInt))
     end
 end)
 
---// re-hunt the state table whenever a fresh character spawns (old table dies)
+--// a new life brings a new state table; the top is kept so the first press of
+--// the new life is already instant (the profile check re-learns it if it changed)
 conns[#conns + 1] = LocalPlayer.CharacterAdded:Connect(function()
     Sprint.gdState = nil
-    task.delay(2, refreshState)
+    Sprint.RestInt = nil
 end)
 
 local M = Tabs.Main
