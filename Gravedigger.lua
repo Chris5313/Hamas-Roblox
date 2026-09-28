@@ -48,6 +48,16 @@
 --// survive that — the character physically moves at target speed the frame you
 --// press. Peak speeds are recorded per sprint (Sprint.peakWS / Sprint.peakSP)
 --// so a later check shows exactly what your run did.
+--//
+--// v1.8: GROUND-SPEED CONTROLLER — post-rejoin probe proved Character IS the
+--// faction model (Workspace.nation_team.sebawar) and the game's ramp loop owns
+--// its Humanoid (61 WS writes / 6s) but moves the body with its own integrator
+--// (WalkSpeed is cosmetic — pinning it changed nothing, velocity-drive fought
+--// it). v1.8 measures REAL displacement per tick (position delta — catches
+--// CFrame stepping too) and integrates our velocity contribution until actual
+--// ground speed equals the target, whatever the game's integrator adds. Total
+--// speed converges to target in ~0.3s; collisions still respected (velocity
+--// based, no wall clipping).
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -76,7 +86,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.7",
+        Version = "1.8",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -412,10 +422,9 @@ conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
---// backup enforcer + DIRECT DRIVE (v1.7): we no longer depend on the game's
---// WalkSpeed consumer at all — while Shift is held the character is driven at
---// target speed along MoveDirection every Heartbeat. Vertical velocity and
---// everything else is preserved. WalkSpeed stays pinned so animations follow.
+--// backup enforcer + GROUND-SPEED CONTROLLER (v1.8): measure actual displacement
+--// per tick, integrate our velocity share until total ground speed == target.
+local lastPos, lastT, vSet = nil, nil, 0
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if Sprint.ShiftDown then
         local ok, humOrWhy = sprintAllowed()
@@ -427,21 +436,38 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
             local hrp = ch and (ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart)
             if hrp and not hrp.Anchored then
                 local md = hum.MoveDirection
-                if md.Magnitude > 0.05 then
-                    local v = hrp.AssemblyLinearVelocity
-                    hrp.AssemblyLinearVelocity = Vector3.new(md.Unit.X * Sprint.Target, v.Y, md.Unit.Z * Sprint.Target)
-                    local sp = Vector3.new(md.Unit.X, 0, md.Unit.Z).Magnitude * Sprint.Target
-                    if sp > Sprint.peakSP then Sprint.peakSP = math.floor(sp * 10) / 10 end
+                local now = os.clock()
+                if lastPos and lastT then
+                    local dt = now - lastT
+                    if dt > 0.02 then
+                        local d = hrp.Position - lastPos
+                        local flat = Vector3.new(d.X, 0, d.Z)
+                        if md.Magnitude > 0.05 then
+                            local spActual = flat.Magnitude / dt
+                            if flat.Magnitude > 0.05 and flat.Unit:Dot(md.Unit) < 0 then
+                                spActual = -spActual -- moving against input (knockback etc.)
+                            end
+                            local err = Sprint.Target - spActual
+                            vSet = math.clamp(vSet + err * dt * 8, 0, 24)
+                            local v = hrp.AssemblyLinearVelocity
+                            hrp.AssemblyLinearVelocity = Vector3.new(md.Unit.X * vSet, v.Y, md.Unit.Z * vSet)
+                            if spActual > Sprint.peakSP then Sprint.peakSP = math.floor(spActual * 10) / 10 end
+                        else
+                            vSet = 0
+                        end
+                    end
                 end
+                lastPos, lastT = hrp.Position, now
+                if hum.WalkSpeed > Sprint.peakWS then Sprint.peakWS = math.floor(hum.WalkSpeed * 10) / 10 end
             end
-            if hum.WalkSpeed > Sprint.peakWS then Sprint.peakWS = math.floor(hum.WalkSpeed * 10) / 10 end
         elseif humOrWhy ~= Sprint.lastBlock then
             Sprint.lastBlock = humOrWhy
             sLog("Shift held but sprint BLOCKED:", humOrWhy)
         end
     else
+        lastPos, lastT, vSet = nil, nil, 0
         if Sprint.peakSP > 0 then
-            sLog("sprint ended — peak WS", Sprint.peakWS, "| peak speed", Sprint.peakSP)
+            sLog("sprint ended — peak WS", Sprint.peakWS, "| ACTUAL ground speed", Sprint.peakSP)
             Sprint.peakWS, Sprint.peakSP = 0, 0
         end
     end
@@ -548,7 +574,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.7 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.8 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.6 loaded — ESP + sprint watchdog", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.8 — sprint controller", Duration = 3 })
 end)
