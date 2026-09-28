@@ -14,6 +14,11 @@
 --// v1.2: LOAD FIX — `m:GetAttribute` (method access without a call) is a syntax
 --// error in Luau too, so loadstring returned nil and the executor printed
 --// "attempt to call a nil value" on the loader line. Plain GetAttribute calls now.
+--// v1.3: PROP FILTER — v1.2 boxed every anchored prop (graves/fences/crates) as
+--// "enemy" because a missing team key counted as hostile. A model is only a live
+--// entity now if it has a Humanoid, or is unanchored AND moving (static unanchored
+--// junk drops after 8s). Probe now dumps EVERY raw model with keep/skip + reason
+--// and the workspace layout, so the real spawn container/team field is obvious.
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -42,7 +47,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.2",
+        Version = "1.3",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -84,6 +89,31 @@ local function isAlive(m)
     return true
 end
 
+--// v1.3 prop filter: map props are anchored and humanoid-less; live models either
+--// have a Humanoid or MOVE. An unanchored, humanoid-less model that has not moved
+--// for PROP_STATIC_TIME stops being tracked.
+local PROP_STATIC_TIME = 8
+local seenModels = {}
+local function isEntity(m)
+    if m:FindFirstChildOfClass("Humanoid") then return true end
+    local root = modelRoot(m)
+    if not root or root.Anchored then return false end
+    local now = os.clock()
+    local rec = seenModels[m]
+    if not rec then
+        seenModels[m] = { pos = root.Position, still = 0, t = now }
+        return true
+    end
+    if (root.Position - rec.pos).Magnitude < 0.3 then
+        rec.still = rec.still + (now - rec.t)
+    else
+        rec.still = 0
+        rec.pos = root.Position
+    end
+    rec.t = now
+    return rec.still < PROP_STATIC_TIME
+end
+
 --// read a team id off a custom model, or nil when it carries none. The probe
 --// dump tells us which of these the game actually uses; all of them are cheap.
 local function teamKeyOf(m)
@@ -105,19 +135,33 @@ local function myTeamKey()
     return t and ("player:" .. tostring(t)) or nil
 end
 
---// candidate models: top-level workspace models + one level inside every folder
---// (covers Units/Enemies/NPCs containers without a full-descriptor scan)
-local function candidateModels()
+--// candidates: raw scan = top-level workspace models + two levels inside folders
+--// (covers Units/WaveN/Enemy containers); candidateModels() applies the entity
+--// filters on top of that.
+local function rawCandidates()
     local out = {}
     local function add(m)
-        if m:IsA("Model") and m ~= LocalPlayer.Character and isAlive(m) and modelRoot(m) then
-            out[#out + 1] = m
-        end
+        if m:IsA("Model") then out[#out + 1] = m end
     end
     for _, m in ipairs(workspace:GetChildren()) do add(m) end
     for _, f in ipairs(workspace:GetChildren()) do
         if f:IsA("Folder") then
             for _, m in ipairs(f:GetChildren()) do add(m) end
+            for _, g in ipairs(f:GetChildren()) do
+                if g:IsA("Folder") then
+                    for _, m in ipairs(g:GetChildren()) do add(m) end
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function candidateModels()
+    local out = {}
+    for _, m in ipairs(rawCandidates()) do
+        if m ~= LocalPlayer.Character and isAlive(m) and modelRoot(m) and isEntity(m) then
+            out[#out + 1] = m
         end
     end
     return out
@@ -232,11 +276,27 @@ M:CreateButton({
             say("player", pl.Name, "| team:", pl.Team and pl.Team.Name or "none",
                 "| char:", pl.Character and pl.Character.Name or "-")
         end
-        for _, m in ipairs(candidateModels()) do
-            local k = teamKeyOf(m)
-            say(("model %s | parts=%d | teamKey=%s | sorted=%s"):format(
-                m.Name, #m:GetDescendants(), tostring(k),
-                k == myTeamKey() and "TEAM" or "ENEMY"))
+        for i, c in ipairs(workspace:GetChildren()) do
+            if i <= 40 then
+                say(("ws: %s (%s) children=%d"):format(c.Name, c.ClassName, #c:GetChildren()))
+            end
+        end
+        for _, m in ipairs(rawCandidates()) do
+            if m == LocalPlayer.Character then
+                say("skip", m.Name, "(you)")
+            elseif not isAlive(m) then
+                say("skip", m.Name, "(no parts / dead)")
+            elseif not isEntity(m) then
+                say("skip", m.Name, "(prop: anchored or static)")
+            else
+                local k = teamKeyOf(m)
+                say(("keep %s | parent=%s | hum=%s | anchored=%s | teamKey=%s | sorted=%s"):format(
+                    m.Name, m.Parent and m.Parent.Name or "?",
+                    m:FindFirstChildOfClass("Humanoid") and "y" or "n",
+                    tostring(modelRoot(m) and modelRoot(m).Anchored),
+                    tostring(k),
+                    k == myTeamKey() and "TEAM" or "ENEMY"))
+            end
         end
         say("done —", #lines, "lines")
     end,
@@ -256,10 +316,27 @@ getgenv().HamasGD_Probe = function()
         say("player", pl.Name, "| team:", pl.Team and pl.Team.Name or "none",
             "| char:", pl.Character and pl.Character.Name or "-")
     end
-    for _, m in ipairs(candidateModels()) do
-        say(("model %s | parts=%d | teamKey=%s | sorted=%s"):format(
-            m.Name, #m:GetDescendants(), tostring(teamKeyOf(m)),
-            teamKeyOf(m) == myTeamKey() and "TEAM" or "ENEMY"))
+    for i, c in ipairs(workspace:GetChildren()) do
+        if i <= 40 then
+            say(("ws: %s (%s) children=%d"):format(c.Name, c.ClassName, #c:GetChildren()))
+        end
+    end
+    for _, m in ipairs(rawCandidates()) do
+        if m == LocalPlayer.Character then
+            say("skip", m.Name, "(you)")
+        elseif not isAlive(m) then
+            say("skip", m.Name, "(no parts / dead)")
+        elseif not isEntity(m) then
+            say("skip", m.Name, "(prop: anchored or static)")
+        else
+            local k = teamKeyOf(m)
+            say(("keep %s | parent=%s | hum=%s | anchored=%s | teamKey=%s | sorted=%s"):format(
+                m.Name, m.Parent and m.Parent.Name or "?",
+                m:FindFirstChildOfClass("Humanoid") and "y" or "n",
+                tostring(modelRoot(m) and modelRoot(m).Anchored),
+                tostring(k),
+                k == myTeamKey() and "TEAM" or "ENEMY"))
+        end
     end
     say("done —", n, "lines")
     return n
@@ -271,10 +348,11 @@ end
 getgenv().HamasGD_Shutdown = function()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     conns = {}
+    for k in pairs(seenModels) do seenModels[k] = nil end
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.2 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.3 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.2 loaded — ESP first", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.3 loaded — ESP first", Duration = 3 })
 end)
