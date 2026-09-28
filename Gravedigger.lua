@@ -400,12 +400,19 @@ local Combat = {
     Aimbot = false, Silent = false, SilentAlways = true,
     Key = Enum.KeyCode.E, Mode = "Hold", KeyDown = false, Toggled = false, Active = false,
     Fov = 90, MaxDist = 700, Smooth = 0.2, Part = "Head", SilentPart = "Head",
-    Visible = true, Priority = "Crosshair", DrawFov = false,
-    SilentMethod = "Camera ray", Hitbox = 0,
+    Visible = true, Priority = "Crosshair",
     Tracer = true, TracerAlways = false, TracerColor = Color3.fromRGB(120, 255, 140),
     TracerTime = 0.4,
     Target = nil, TargetPart = nil, SilentTarget = nil, SilentPart2 = nil,
     Shots = 0, Writes = 0, Hook = nil,
+    --// each selector owns its cone, and each cone can be drawn on screen
+    FovDraw = false, FovColor = Color3.fromRGB(0, 230, 118), FovThick = 1.5, FovTrans = 0.3,
+    SilentFov = 90, SilentFovDraw = false, SilentFovColor = Color3.fromRGB(80, 200, 255),
+    SilentFovThick = 1.5, SilentFovTrans = 0.3,
+    --// triggerbot: real mouse click once a target has sat inside TriggerFov for
+    --// TriggerDelay ms (0 = instant, 300+ = looks human)
+    Trigger = false, TriggerDelay = 60, TriggerFov = 4, TriggerLos = true, TriggerPart = "Head",
+    TriggerTarget = nil, TriggerShots = 0, LockSince = 0, LastFire = 0, LastTriggerName = nil,
     --// diagnostics: with Watch on, every ray-ish method the game calls is counted,
     --// so we can prove which call each weapon actually fires through
     Watch = false, Seen = {},
@@ -499,6 +506,24 @@ M:CreateToggle("GD_AimVisible", { Title = "Visible only", Default = true,
     Description = "Skip enemies behind cover (raycast line of sight)",
     Callback = function(v) Combat.Visible = v end })
 
+M:CreateToggle("GD_AimFovDraw", { Title = "Show aimbot FOV circle", Default = false,
+    Description = "Draws the aimbot's cone as a ring around your crosshair",
+    Callback = function(v) Combat.FovDraw = v end })
+
+pcall(function()
+    M:CreateColorpicker("GD_AimFovColor", { Title = "Aimbot FOV colour",
+        Default = Color3.fromRGB(0, 230, 118),
+        Callback = function(v) Combat.FovColor = v end })
+end)
+
+M:CreateSlider("GD_AimFovThick", { Title = "Aimbot FOV thickness", Default = 1.5, Min = 1, Max = 8, Rounding = 1,
+    Description = "Ring line width in pixels",
+    Callback = function(v) Combat.FovThick = v end })
+
+M:CreateSlider("GD_AimFovTrans", { Title = "Aimbot FOV transparency", Default = 0.3, Min = 0, Max = 0.95, Rounding = 2,
+    Description = "0 = solid ring, 0.95 = barely visible",
+    Callback = function(v) Combat.FovTrans = v end })
+
 M:CreateSection("Combat — Silent aim")
 M:CreateToggle("GD_Silent", { Title = "Silent aim", Default = false,
     Description = "Sends your bullets to the enemy without moving your camera",
@@ -528,6 +553,26 @@ M:CreateDropdown("GD_SilentPart", { Title = "Silent aim part",
     Values = { "Head", "UpperTorso", "HumanoidRootPart", "Nearest" }, Default = "Head",
     Description = "Nearest is the most forgiving: it uses whichever part of the enemy is closest to you",
     Callback = function(v) Combat.SilentPart = v end })
+
+M:CreateSlider("GD_SilentFov", { Title = "Silent aim FOV", Default = 90, Min = 1, Max = 360, Rounding = 0,
+    Description = "How far off-centre silent aim may pick a target (degrees, full width)",
+    Callback = function(v) Combat.SilentFov = v end })
+
+M:CreateToggle("GD_SilentFovDraw", { Title = "Show silent FOV circle", Default = false,
+    Description = "Draws the silent-aim cone as a second ring around your crosshair",
+    Callback = function(v) Combat.SilentFovDraw = v end })
+
+pcall(function()
+    M:CreateColorpicker("GD_SilentFovColor", { Title = "Silent FOV colour",
+        Default = Color3.fromRGB(80, 200, 255),
+        Callback = function(v) Combat.SilentFovColor = v end })
+end)
+
+M:CreateSlider("GD_SilentFovThick", { Title = "Silent FOV thickness", Default = 1.5, Min = 1, Max = 8, Rounding = 1,
+    Callback = function(v) Combat.SilentFovThick = v end })
+
+M:CreateSlider("GD_SilentFovTrans", { Title = "Silent FOV transparency", Default = 0.3, Min = 0, Max = 0.95, Rounding = 2,
+    Callback = function(v) Combat.SilentFovTrans = v end })
 
 M:CreateToggle("GD_Tracer", { Title = "Trace line", Default = true,
     Description = "Neon line from your gun to whoever each shot was sent to",
@@ -575,12 +620,50 @@ M:CreateButton({
 
 M:CreateButton({
     Title = "Show current target (console + log)",
-    Description = "Prints the enemy aim and silent aim have locked right now",
+    Description = "Prints the enemies aim, silent aim and the triggerbot have locked right now",
     Callback = function()
         cLog("aim target:", Combat.Target and Combat.Target.Name or "none",
             "| silent target:", Combat.SilentTarget and Combat.SilentTarget.Name or "none",
+            "| trigger target:", Combat.TriggerTarget and Combat.TriggerTarget.Name or "none",
             "| shots redirected:", tostring(Combat.Shots),
+            "| trigger shots:", tostring(Combat.TriggerShots),
+            "| fovs:", tostring(Combat.Fov) .. "/" .. tostring(Combat.SilentFov) .. "/" .. tostring(Combat.TriggerFov),
             "| hook:", Combat.Hook and "installed" or "not installed")
+    end,
+})
+
+--// ---------------------------------------------------------------------------
+--// Combat — Triggerbot
+--// ---------------------------------------------------------------------------
+M:CreateSection("Combat — Triggerbot")
+
+M:CreateToggle("GD_Trigger", { Title = "Triggerbot", Default = false,
+    Description = "Fires by itself the moment an enemy crosses your crosshair",
+    Callback = function(v) Combat.Trigger = v cLog("triggerbot", v and "ON" or "OFF") end })
+
+M:CreateSlider("GD_TriggerDelay", { Title = "Trigger delay (ms)", Default = 60, Min = 0, Max = 500, Rounding = 0,
+    Description = "How long a target must stay under your crosshair before the shot. 0 is instant, 250-400 looks human",
+    Callback = function(v) Combat.TriggerDelay = v end })
+
+M:CreateSlider("GD_TriggerFov", { Title = "Trigger cone (degrees)", Default = 4, Min = 1, Max = 40, Rounding = 1,
+    Description = "How close to dead centre a target must be. This is the trigger's own FOV",
+    Callback = function(v) Combat.TriggerFov = v end })
+
+M:CreateDropdown("GD_TriggerPart", { Title = "Trigger part",
+    Values = { "Head", "UpperTorso", "HumanoidRootPart", "Nearest" }, Default = "Head",
+    Description = "Which part of the enemy has to be inside the trigger cone",
+    Callback = function(v) Combat.TriggerPart = v end })
+
+M:CreateToggle("GD_TriggerLos", { Title = "Trigger needs line of sight", Default = true,
+    Description = "Off = the trigger will shoot enemies you cannot even see",
+    Callback = function(v) Combat.TriggerLos = v end })
+
+M:CreateButton({
+    Title = "Test trigger click",
+    Description = "Fires one click straight away so you can check the trigger's input path works",
+    Callback = function()
+        local c = getgenv().HamasGD_Combat
+        cLog("trigger test:", c.TriggerFire and tostring(c.TriggerFire()) or "unavailable")
     end,
 })
 
@@ -601,6 +684,16 @@ M:CreateButton({
 --//
 --// TRACER: every shot silent aim redirects draws a client-only neon beam from
 --// your muzzle to the enemy it was sent to, so you can see exactly who it picked.
+--//
+--// TRIGGERBOT: fires a real mouse click the moment an enemy has been inside its own
+--// cone for TriggerDelay ms. 0 ms is instant; 250-400 ms reads as human reaction.
+--// It only fires while you actually hold a weapon, and it never fires at a target it
+--// cannot see unless "Trigger needs line of sight" is switched off.
+--//
+--// FOV RINGS: aimbot, silent aim and the triggerbot each own a cone (Combat.Fov,
+--// Combat.SilentFov, Combat.TriggerFov). The first two can draw their cone on screen
+--// as a ring — that ring IS the region the selection code tests, so you can see
+--// exactly how much of your screen each feature is allowed to pick from.
 --// ===========================================================================
 --// pick the part we aim at. "Nearest" = the closest base part on that fighter,
 --// which is the most forgiving target for silent aim.
@@ -640,9 +733,13 @@ local function fovAngle(part)
     return math.deg(math.acos(math.clamp(cam.CFrame.LookVector:Dot(to.Unit), -1, 1)))
 end
 
---// the one and only target chooser: FOV -> line of sight -> priority
-local function pickTarget(partName, requireKey)
+--// the one and only target chooser: FOV -> line of sight -> priority.
+--// `fov` lets every feature use its own cone; `los` overrides Combat.Visible so the
+--// triggerbot can be told to ignore walls even while the aimbot still respects them.
+local function pickTarget(partName, requireKey, fov, los)
     if requireKey and not Combat.Active then return nil end
+    fov = tonumber(fov) or Combat.Fov
+    if los == nil then los = Combat.Visible end
     local camPos = cam.CFrame.Position
     local list = myEnemies(camPos, Combat.MaxDist)
     local best, bestScore
@@ -651,7 +748,7 @@ local function pickTarget(partName, requireKey)
         local part = partFor(m, partName)
         if part then
             local ang = fovAngle(part)
-            if ang <= Combat.Fov * 0.5 and (not Combat.Visible or losClear(camPos, part, m)) then
+            if ang <= fov * 0.5 and (not los or losClear(camPos, part, m)) then
                 local score = (Combat.Priority == "Distance") and e.d or ang
                 if not bestScore or score < bestScore then
                     best, bestScore = { m = m, part = part, d = e.d, ang = ang }, score
@@ -813,6 +910,179 @@ end
 Combat.install, Combat.remove, Combat.pickTarget = installSilentHook, removeSilentHook, pickTarget
 
 --// ---------------------------------------------------------------------------
+--// on-screen FOV rings + the triggerbot
+--// ---------------------------------------------------------------------------
+--// The rings are plain ScreenGui frames: a square Frame made round by UICorner and
+--// outlined by a UIStroke, so they need no image assets. The radius is the camera's
+--// aim cone projected onto the screen, which is why the ring really does mark the
+--// area `ang <= fov / 2` covers.
+local fovGui, ringA, strokeA, ringS, strokeS
+
+local function fovRoot()
+    if fovGui and fovGui.Parent then return fovGui end
+    local parent
+    local okH, h = pcall(function() return (gethui or get_hidden_ui)() end)
+    if okH and h then parent = h end
+    if not parent then
+        local okC, c = pcall(function() return game:GetService("CoreGui") end)
+        if okC then parent = c end
+    end
+    if not parent then return nil end
+    fovGui = Instance.new("ScreenGui")
+    fovGui.Name = "HamasFov"
+    --// IgnoreGuiInset makes scale (0.5, 0.5) land exactly on the camera centre
+    fovGui.IgnoreGuiInset = true
+    fovGui.ResetOnSpawn = false
+    fovGui.DisplayOrder = 999
+    fovGui.Parent = parent
+    return fovGui
+end
+
+local function makeRing()
+    local gui = fovRoot()
+    if not gui then return nil end
+    local f = Instance.new("Frame")
+    f.Name = "FovRing"
+    f.AnchorPoint = Vector2.new(0.5, 0.5)
+    f.Position = UDim2.fromScale(0.5, 0.5)
+    f.BackgroundTransparency = 1
+    f.BorderSizePixel = 0
+    f.Visible = false
+    f.ZIndex = 2
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = f
+    local stroke = Instance.new("UIStroke")
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.LineJoinMode = Enum.LineJoinMode.Round
+    stroke.Parent = f
+    f.Parent = gui
+    return f, stroke
+end
+
+--// screen radius of a cone `fovDeg` wide around the camera's forward axis
+local function fovRadius(fovDeg)
+    local c = cam
+    if not c then return 0 end
+    local half = math.rad(math.clamp((tonumber(fovDeg) or 0) * 0.5, 0.5, 89))
+    local camHalf = math.rad(math.clamp(c.FieldOfView, 1, 120)) * 0.5
+    local r = (c.ViewportSize.Y * 0.5) * math.tan(half) / math.tan(camHalf)
+    return math.clamp(r, 4, c.ViewportSize.Y * 1.5)
+end
+
+--// The ScreenGui's own centre is NOT always the camera centre (CoreGui adds an
+--// inset that varies with resolution and DPI), so rather than guessing it we
+--// measure once: a ring is created at plain scale (0.5, 0.5), and the first time it
+--// renders we learn the pixel gap and apply it to both rings forever after.
+local ringBias, ringBiasViewport, ringBiasDone = Vector2.zero, nil, false
+
+local function measureRingBias(ring)
+    local c = cam
+    if not (c and ring) then return end
+    if ringBiasDone and ringBiasViewport == c.ViewportSize then return end
+    if ringBiasViewport and ringBiasViewport ~= c.ViewportSize then
+        --// the window was resized: forget the old offset and re-measure cleanly
+        ringBias, ringBiasDone, ringBiasViewport = Vector2.zero, false, c.ViewportSize
+        ring.Position = UDim2.fromScale(0.5, 0.5)
+        return
+    end
+    local centre = ring.AbsolutePosition + ring.AbsoluteSize * 0.5
+    if centre.X < 1 or centre.Y < 1 then return end --// not rendered yet
+    ringBias = (c.ViewportSize * 0.5) - centre
+    ringBiasViewport, ringBiasDone = c.ViewportSize, true
+    cLog("fov ring offset " .. tostring(math.floor(ringBias.X)) .. "," .. tostring(math.floor(ringBias.Y)))
+end
+
+local function updateRing(ring, stroke, draw, fov, color, thick, trans)
+    if not ring then return end
+    if not draw then
+        if ring.Visible then ring.Visible = false end
+        return
+    end
+    local r = fovRadius(fov)
+    if r <= 4 then
+        if ring.Visible then ring.Visible = false end
+        return
+    end
+    ring.Size = UDim2.fromOffset(r * 2, r * 2)
+    ring.Position = UDim2.new(0.5, ringBias.X, 0.5, ringBias.Y)
+    ring.Visible = true
+    if stroke then
+        stroke.Color = (typeof(color) == "Color3") and color or Color3.fromRGB(0, 230, 118)
+        stroke.Thickness = tonumber(thick) or 1.5
+        stroke.Transparency = math.clamp(tonumber(trans) or 0.3, 0, 0.98)
+    end
+    measureRingBias(ring)
+end
+
+local function drawFovRings()
+    if not ringA and Combat.FovDraw then ringA, strokeA = makeRing() end
+    if not ringS and Combat.SilentFovDraw then ringS, strokeS = makeRing() end
+    updateRing(ringA, strokeA, Combat.FovDraw, Combat.Fov,
+        Combat.FovColor, Combat.FovThick, Combat.FovTrans)
+    updateRing(ringS, strokeS, Combat.SilentFovDraw, Combat.SilentFov,
+        Combat.SilentFovColor, Combat.SilentFovThick, Combat.SilentFovTrans)
+end
+
+--// triggerbot: click through the same input path your mouse uses. mouse1click()
+--// exists on most executors; SendMouseButtonEvent is the fallback so this still
+--// works on an executor that does not expose it.
+local mouseBtn1 = Enum.UserInputType.MouseButton1.Value
+local function triggerFire()
+    if type(mouse1click) == "function" then
+        if pcall(mouse1click) then return true end
+    end
+    local c = cam
+    if not c then return false end
+    local vim = game:GetService("VirtualInputManager")
+    local x, y = c.ViewportSize.X * 0.5, c.ViewportSize.Y * 0.5
+    local ok = pcall(function() vim:SendMouseButtonEvent(x, y, mouseBtn1, true, game, 0) end)
+    if not ok then return false end
+    task.delay(0.03, function()
+        pcall(function() vim:SendMouseButtonEvent(x, y, mouseBtn1, false, game, 0) end)
+    end)
+    return true
+end
+
+--// exposed so the "Test trigger click" button can prove the click path works
+Combat.TriggerFire = triggerFire
+
+--// called from the main loop each frame
+local function updateTrigger(typing)
+    if not Combat.Trigger or typing then
+        Combat.TriggerTarget, Combat.LockSince = nil, 0
+        return
+    end
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local tool = ch and ch:FindFirstChildWhichIsA("Tool")
+    if not (ch and hum and hum.Health > 0 and tool) then
+        --// no weapon in hand (or dead): never click
+        Combat.TriggerTarget, Combat.LockSince = nil, 0
+        return
+    end
+    local t = pickTarget(Combat.TriggerPart, false, Combat.TriggerFov, Combat.TriggerLos)
+    if not t then
+        Combat.TriggerTarget, Combat.LockSince = nil, 0
+        return
+    end
+    Combat.TriggerTarget = t.m
+    local now = os.clock()
+    if Combat.LockSince == 0 then Combat.LockSince = now end
+    local delay_s = math.clamp(tonumber(Combat.TriggerDelay) or 0, 0, 5000) / 1000
+    if (now - Combat.LockSince) >= delay_s and (now - (tonumber(Combat.LastFire) or 0)) > 0.05 then
+        if triggerFire() then
+            Combat.TriggerShots = Combat.TriggerShots + 1
+            Combat.LastFire, Combat.LockSince = now, now
+            if Combat.LastTriggerName ~= t.m.Name then
+                Combat.LastTriggerName = t.m.Name
+                cLog("trigger -> " .. tostring(t.m.Name) .. " (delay " .. tostring(math.floor(delay_s * 1000)) .. "ms)")
+            end
+        end
+    end
+end
+
+--// ---------------------------------------------------------------------------
 --// per-frame: resolve the target, drive the camera (aimbot only), feed silent aim
 --// ---------------------------------------------------------------------------
 local lastPreview = 0
@@ -831,13 +1101,13 @@ conns[#conns + 1] = RunService.RenderStepped:Connect(function(dt)
     Combat.SilentTarget, Combat.SilentPart2 = nil, nil
 
     if wantAim then
-        local t = pickTarget(Combat.Part, false)
+        local t = pickTarget(Combat.Part, false, Combat.Fov)
         if t then
             Combat.Target, Combat.TargetPart = t.m, t.part
         end
     end
     if wantSilent then
-        local t = pickTarget(Combat.SilentPart, false)
+        local t = pickTarget(Combat.SilentPart, false, Combat.SilentFov)
         if t then
             Combat.SilentTarget, Combat.SilentPart2 = t.m, t.part
         end
@@ -858,6 +1128,10 @@ conns[#conns + 1] = RunService.RenderStepped:Connect(function(dt)
             drawTracer(Combat.SilentPart2.Position)
         end
     end
+
+    --// triggerbot + the two FOV rings
+    updateTrigger(typing)
+    if Combat.FovDraw or Combat.SilentFovDraw then drawFovRings() end
 end)
 
 --// ---------------------------------------------------------------------------
@@ -887,7 +1161,7 @@ conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
 end)
 
 --// ---------------------------------------------------------------------------
---// v3.0
+--// v3.1
 --// shutdown
 --// ===========================================================================
 getgenv().HamasGD_Shutdown = function()
@@ -897,9 +1171,11 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
     local t = workspace:FindFirstChild("HamasTracers")
     if t then pcall(function() t:Destroy() end) end
+    if fovGui then pcall(function() fovGui:Destroy() end) end
+    fovGui, ringA, ringS = nil, nil, nil
 end
 
-print("[Hamas] Gravedigger v3.0 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v3.1 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient",        Content = "Gravedigger v3.0 — aimbot + silent aim", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient",        Content = "Gravedigger v3.1 — aimbot + silent aim + trigger", Duration = 3 })
 end)
