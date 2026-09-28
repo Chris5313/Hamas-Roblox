@@ -415,7 +415,7 @@ end)
 --// backup enforcer + DIRECT DRIVE (v1.7): we no longer depend on the game's
 --// WalkSpeed consumer at all — while Shift is held the character is driven at
 --// target speed along MoveDirection every Heartbeat. Vertical velocity and
----- everything else is preserved. WalkSpeed stays pinned so animations follow.
+--// everything else is preserved. WalkSpeed stays pinned so animations follow.
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if Sprint.ShiftDown then
         local ok, humOrWhy = sprintAllowed()
