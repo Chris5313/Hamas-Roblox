@@ -442,7 +442,17 @@ end
 --// real Shift tracking (gameProcessed = typing in chat / UI has focus)
 conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
     if input.KeyCode == Enum.KeyCode.LeftShift then
+        local was = Sprint.ShiftDown
         Sprint.ShiftDown = not gp
+        if Sprint.ShiftDown and not was then
+            --// WalkSpeed at the instant of the press IS the game's base_speed:
+            --// int_speed has decayed to 0 by then, so WalkSpeed = base_speed + 0.
+            --// Reading it here is reliable; rawget on the state-table proxy is not
+            --// (it returned nil for base_speed and a stale 9 for int_speed).
+            local ch = LocalPlayer.Character
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            if hum and hum.WalkSpeed > 0 then Sprint.BaseAtPress = hum.WalkSpeed end
+        end
         if Sprint.Enabled then
             sLog("Shift DOWN", Sprint.Peak and ("-> straight to " .. Sprint.Peak .. " st/s")
                 or "-> learning your sprint top on this one")
@@ -533,7 +543,6 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     end
 
     local st = Sprint.gdState
-    local base = baseSpeed()
     local now = os.clock()
 
     --// the state table is a proxy that refreshes lazily: if we lost it, scavenge
@@ -541,15 +550,27 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     if not st and (not Sprint.lastHunt or now - Sprint.lastHunt > 2) then
         Sprint.lastHunt = now
         st = refreshState()
-        base = baseSpeed()
     end
+
+    --// base_speed = the flat walking part of the model. The state-table read is
+    --// only a nice-to-have (that proxy returned nil for it); the WalkSpeed value
+    --// captured at the moment Shift went down is the real thing, and every reading
+    --// this game has ever given us was 10.
+    local base = baseSpeed()
+    if not base then base = Sprint.BaseAtPress end
+    if not base and not Sprint.ShiftDown then
+        local ws0 = hum.WalkSpeed
+        if ws0 > 0 and (not Sprint.Peak or ws0 < Sprint.Peak) then Sprint.WalkBase = ws0 end
+    end
+    if not base then base = Sprint.WalkBase end
+    if not base or base <= 0 then base = 10 end
 
     --// base_speed moved => different speed profile (class/loadout), so the learned
     --// top no longer describes this character. Forget it and re-learn instead of
     --// pinning a number that could sit below the real sprint speed.
-    if base and Sprint.Base and math.abs(base - Sprint.Base) > 0.01 then
+    if base and Sprint.Base and math.abs(base - Sprint.Base) > 0.6 then
         Sprint.Peak, Sprint.PeakAt = nil, nil
-        sLog("speed profile changed — re-learning your sprint top")
+        sLog("speed profile changed -> re-learning your sprint top")
     end
 
     --// never act on a peak we just watched rise: that means the game is still
@@ -565,8 +586,11 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
             local ws = hum.WalkSpeed
             if ws > (Sprint.Peak or 0) + 0.01 then
                 Sprint.Peak, Sprint.PeakAt, Sprint.Base = ws, now, base
-                if ws - (base or 10) > 1 then
-                    sLog(("sprint top learned: %.1f st/s — Shift now jumps straight there"):format(ws))
+                --// the ramp climbs in steps, so only announce real movement in the
+                --// learned top (every 1 st/s) instead of once per frame
+                if (Sprint.loggedPeak or 0) + 1 <= ws then
+                    Sprint.loggedPeak = ws
+                    sLog(("sprint top: %.1f st/s (base %.1f)"):format(ws, base))
                 end
             end
         end
