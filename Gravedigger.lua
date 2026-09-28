@@ -606,13 +606,6 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
         end
         if not Sprint.ShiftDown and mod ~= nil then Sprint.RestMod = mod end
 
-        --// the game's own resting int_speed (0 on every reading). We hand it back
-        --// when we stop writing, so a removed ramp never leaks into walking speed.
-        --// Tracked as a minimum so a frame caught mid-decay cannot poison it.
-        if not Sprint.ShiftDown and (not Sprint.lastWrite or now - Sprint.lastWrite > 0.6) then
-            Sprint.RestInt = math.min(Sprint.RestInt or int, int)
-        end
-
         if Sprint.TopInt == nil or int > Sprint.TopInt + 0.01 then
             Sprint.TopInt, Sprint.TopAt = int, now
             if int > (Sprint.loggedTop or 0) + 0.5 then
@@ -642,6 +635,15 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     end
     Sprint.learnNote = nil
     Sprint.lastBlock = nil
+
+    --// first write of a burst: remember the value the game itself had BEFORE we
+    --// touch it. Captured here (not on some earlier frame) so it can never be
+    --// raced away by the load-time table hunt — the release always hands it back.
+    if not Sprint.lastWrite or now - Sprint.lastWrite > 0.5 then
+        Sprint.RestInt = int
+        sLog(("hijacking: game's own int_speed was %.2f, holding the top (%.2f) instead")
+            :format(int or -1, Sprint.TopInt))
+    end
 
     local ok, err = pcall(function()
         rawset(st, "int_speed", Sprint.TopInt) --// the game's own top, instantly
