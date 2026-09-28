@@ -58,6 +58,14 @@
 --// ground speed equals the target, whatever the game's integrator adds. Total
 --// speed converges to target in ~0.3s; collisions still respected (velocity
 --// based, no wall clipping).
+--//
+--// v1.9: AUTO-CALIBRATED SPRINT — the v1.8 logs exposed the real bug: actual
+--// ground speed during sprint measured ~22 st/s, i.e. the game's true sprint top
+--// speed is ~22 and WalkSpeed (10->16) was ALWAYS cosmetic. Targeting 16 meant
+--// the controller BRAKED the player below his normal sprint. v1.9 calibrates:
+--// the first sprint measures the real top speed (Learned), and every sprint
+--// after drives straight to it from the first press — no ramp. Bonus slider can
+--// push above the learned top (server has shown it tolerates >= 22).
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -86,7 +94,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.8",
+        Version = "1.9",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -355,6 +363,11 @@ getgenv().HamasGD_ESP = ESP
 --// ===========================================================================
 local Sprint = { Enabled = false, Target = 16, Overrides = 0, ShiftDown = false,
     peakWS = 0, peakSP = 0 }
+--// keep the calibrated sprint speed across re-executes
+do
+    local prev = getgenv().HamasGD_Sprint
+    if prev and prev.Learned then Sprint.Learned = prev.Learned end
+end
 getgenv().HamasGD_Sprint = Sprint
 
 local sprintLog = {}
@@ -422,8 +435,9 @@ conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
---// backup enforcer + GROUND-SPEED CONTROLLER (v1.8): measure actual displacement
---// per tick, integrate our velocity share until total ground speed == target.
+--// backup enforcer + AUTO-CALIBRATED GROUND-SPEED CONTROLLER (v1.9):
+--//   sprint 1 = calibration (measures the game's real top speed)
+--//   sprint 2+ = driven straight to Learned (+ bonus) from the first press
 local lastPos, lastT, vSet = nil, nil, 0
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if Sprint.ShiftDown then
@@ -445,13 +459,31 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
                         if md.Magnitude > 0.05 then
                             local spActual = flat.Magnitude / dt
                             if flat.Magnitude > 0.05 and flat.Unit:Dot(md.Unit) < 0 then
-                                spActual = -spActual -- moving against input (knockback etc.)
+                                spActual = -spActual
                             end
-                            local err = Sprint.Target - spActual
-                            vSet = math.clamp(vSet + err * dt * 8, 0, 24)
-                            local v = hrp.AssemblyLinearVelocity
-                            hrp.AssemblyLinearVelocity = Vector3.new(md.Unit.X * vSet, v.Y, md.Unit.Z * vSet)
-                            if spActual > Sprint.peakSP then Sprint.peakSP = math.floor(spActual * 10) / 10 end
+                            if spActual > 0 then
+                                if not Sprint.Learned then
+                                    -- CALIBRATION: follow the game's own ramp and record its top
+                                    Sprint.learnT = (Sprint.learnT or 0) + dt
+                                    Sprint.learnMax = math.max(Sprint.learnMax or 0, spActual)
+                                    if Sprint.learnT > 3
+                                        or (Sprint.learnT > 1.2
+                                            and (Sprint.learnMax - spActual) < 0.4) then
+                                        Sprint.Learned = math.max(16, math.floor(Sprint.learnMax + 0.5))
+                                        sLog("calibrated: your real sprint top is", Sprint.Learned,
+                                            "st/s — sprints are instant from now on")
+                                        Sprint.learnT, Sprint.learnMax = nil, nil
+                                    end
+                                else
+                                    -- DRIVE: straight to learned top (+ bonus), every press
+                                    local tgt = Sprint.Learned + (Sprint.Bonus or 0)
+                                    local err = tgt - spActual
+                                    vSet = math.clamp(vSet + err * dt * 8, 0, 30)
+                                    local v = hrp.AssemblyLinearVelocity
+                                    hrp.AssemblyLinearVelocity = Vector3.new(md.Unit.X * vSet, v.Y, md.Unit.Z * vSet)
+                                    if spActual > Sprint.peakSP then Sprint.peakSP = math.floor(spActual * 10) / 10 end
+                                end
+                            end
                         else
                             vSet = 0
                         end
@@ -466,6 +498,7 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
         end
     else
         lastPos, lastT, vSet = nil, nil, 0
+        Sprint.learnT, Sprint.learnMax = nil, nil
         if Sprint.peakSP > 0 then
             sLog("sprint ended — peak WS", Sprint.peakWS, "| ACTUAL ground speed", Sprint.peakSP)
             Sprint.peakWS, Sprint.peakSP = 0, 0
@@ -520,7 +553,8 @@ M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false
     Callback = function(v)
         Sprint.Enabled = v
         if v then
-            sLog("ENABLED — hold LeftShift, pinning WalkSpeed to", Sprint.Target)
+            sLog("ENABLED — first sprint calibrates, then every sprint is instant",
+                Sprint.Learned and ("(calibrated: " .. Sprint.Learned .. " st/s)") or "(not calibrated yet)")
             if not Sprint.ShiftDown then sLog("note: Shift not held yet — press LeftShift to sprint") end
             local ch = LocalPlayer.Character
             if ch and not ch:FindFirstChildOfClass("Humanoid") then
@@ -530,9 +564,9 @@ M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false
             sLog("DISABLED")
         end
     end })
-M:CreateSlider("GD_SprintSpeed", { Title = "Sprint speed (16 = legit max)", Default = 16, Min = 10, Max = 16, Rounding = 0,
-    Description = "16 is what a fully-ramped sprint reaches — stays identical to a legit sprinter on the server",
-    Callback = function(v) Sprint.Target = v end })
+M:CreateSlider("GD_SprintSpeed", { Title = "Extra speed above your sprint", Default = 0, Min = 0, Max = 10, Rounding = 0,
+    Description = "0 = instant full sprint at your game's real top speed. Higher = faster than normal (more visible).",
+    Callback = function(v) Sprint.Bonus = v end })
 
 M:CreateSection("Gravedigger")
 M:CreateButton({
@@ -574,7 +608,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.8 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.9 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.8 — sprint controller", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.9 — calibrated instant sprint", Duration = 3 })
 end)
