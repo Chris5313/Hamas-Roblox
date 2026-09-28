@@ -134,7 +134,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "2.3",
+        Version = "2.4",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -394,25 +394,30 @@ end
 getgenv().HamasGD_ESP = ESP
 
 --// ===========================================================================
---// v2.3 NO-ACCELERATION SPRINT (mapped + identity-proven)
+--// v2.4 NO-ACCELERATION SPRINT (measured + self-verifying)
 --//   * speed model: Humanoid.WalkSpeed = base_speed + int_speed, and int_speed
 --//     IS the ramp — so the ramp is removed by writing int_speed
 --//   * written on RunService.PreSimulation: the last phase before the physics
 --//     step, so this is the value the physics actually consumes
 --//   * the table is identified by proof (base + int == live WalkSpeed), because
 --//     the heap holds several stale copies carrying the same 62 keys
---//   * the number written is the highest int_speed the GAME ITSELF ramps to on
---//     this loadout, so top speed is untouched — only the wait is gone
+--//   * LEARNING READS WalkSpeed ONLY. Reading int_speed back returns our own
+--//     written value, so a table-fed learner eats itself — that is what froze
+--//     the held speed at 11.7 for 61 seconds in the recorded trace. The top is
+--//     the plateau of the game's own sprint (stable 0.25s), measured from
+--//     WalkSpeed, which the trace shows is honest
+--//   * the number written is top - resting, i.e. the player's OWN top speed, so
+--//     nothing is boosted and nothing is capped below what the game gives him
 --//   * sprint_block / sprint_force_stop / sprint_wall_stopper zeroed while held
 --//     so the game cannot kill a sprint mid-run
 --//   * real Shift key tracking (InputBegan/InputEnded, chat-aware)
 --//   * EVERYTHING logged: console + debug log + getgenv().HamasGD_Sprint.Log
 --// ===========================================================================
-local Sprint = { Enabled = false, ShiftDown = false, TopInt = nil, Writes = 0 }
---// keep the learned top across re-executes (same Roblox session)
+local Sprint = { Enabled = false, ShiftDown = false, TopWS = nil, Writes = 0 }
+--// keep the measured top across re-executes (same Roblox session)
 do
     local prev = getgenv().HamasGD_Sprint
-    if prev and prev.TopInt then Sprint.TopInt = prev.TopInt end
+    if prev and prev.TopWS then Sprint.TopWS = prev.TopWS end
 end
 getgenv().HamasGD_Sprint = Sprint
 
@@ -448,8 +453,8 @@ conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
     if input.KeyCode == Enum.KeyCode.LeftShift then
         Sprint.ShiftDown = not gp
         if Sprint.Enabled then
-            sLog("Shift DOWN", Sprint.TopInt and ("-> straight to int_speed " .. Sprint.TopInt)
-                or "-> learning your sprint top on this one")
+            sLog("Shift DOWN", Sprint.TopWS and (("-> straight to %.2f st/s"):format(Sprint.TopWS))
+                or "-> measuring your sprint top on this one")
         end
     end
 end)
@@ -568,101 +573,120 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
 
     if hum.Health <= 0 then
         Sprint.gdState = nil --// dead: this life's table is about to go stale
-        Sprint.RestInt, Sprint.RestMin = nil, nil --// and these belong to that life
+        Sprint.RestInt = nil --// and this belongs to that life
         return
     end
 
     local ws = hum.WalkSpeed
     local now = os.clock()
 
-    --// keep the cached table honest: if base + int stops equalling his WalkSpeed,
-    --// this copy is not his any more (respawn, loadout swap) and must be replaced
-    local st, base, int, mod = Sprint.gdState, nil, nil, nil
+    --// ---------------------------------------------------------------------
+    --// LEARNING USES WalkSpeed, NEVER THIS TABLE. Reading int_speed back hands
+    --// us our OWN written value, so a table-fed learner eats itself: measured, it
+    --// froze the held top at int_speed 1.67 (WalkSpeed 11.7) for 61 seconds while
+    --// the player's real sprint top was 17.6. WalkSpeed is a real property and the
+    --// trace proves it is honest:
+    --//   resting WalkSpeed == base_speed,  plateau WalkSpeed == the sprint top
+    --// ---------------------------------------------------------------------
+    local st = Sprint.gdState
+    local smod
+
+    --// keep the cached table honest (identity: base + int == WalkSpeed)
     if st then
-        base, int, mod = stateRead(st)
+        local base, int, m = stateRead(st)
+        smod = m
         if base and int and math.abs((base + int) - ws) < 1.5 then
             Sprint.badChecks = 0
         else
             Sprint.badChecks = (Sprint.badChecks or 0) + 1
-            if Sprint.badChecks > 10 then
-                Sprint.gdState = nil
+            if Sprint.badChecks > 20 then
+                Sprint.gdState, st = nil, nil
                 sLog("state table stopped matching — hunting the live one again")
             end
         end
     end
-    if not Sprint.gdState then
-        st = refreshState(ws)
-        if st then base, int, mod = stateRead(st) end
+    if not st then st = refreshState(ws) end
+
+    --// the resting WalkSpeed IS base_speed (10 on every reading). Wild jumps are
+    --// ignored so a crouch or a launch cannot move the baseline we measure from.
+    if not Sprint.ShiftDown and ws > 5 and ws < 40 then
+        if not Sprint.WalkBase or math.abs(ws - Sprint.WalkBase) < 3 then
+            Sprint.WalkBase = ws
+        end
     end
 
-    --// learn the game's own sprint top. int_speed IS the ramp, so the highest
-    --// value the game itself ramps to is the top — nothing is invented here.
-    if st and base and int then
-        if not Sprint.ShiftDown and mod ~= nil and Sprint.RestMod ~= nil
-            and mod ~= Sprint.RestMod then
-            Sprint.TopInt, Sprint.TopAt = nil, nil
-            sLog("speed profile changed (" .. tostring(Sprint.RestMod) .. " -> " .. tostring(mod)
-                .. ") — re-learning your sprint top")
-        end
-        if not Sprint.ShiftDown and mod ~= nil then Sprint.RestMod = mod end
-
-        --// the game's own resting int_speed (0 on every real reading). Only
-        --// sampled well after we stopped writing, and kept as a minimum, so our
-        --// own leftover value can never be mistaken for the game's
-        if not Sprint.ShiftDown and (not Sprint.lastWrite or now - Sprint.lastWrite > 0.8) then
-            if Sprint.RestMin == nil or int < Sprint.RestMin then Sprint.RestMin = int end
-        end
-
-        --// a top only counts once the game has HELD that value for 0.4s. Without
-        --// this, a momentary spike (charge/dash/perk) would be latched as the new
-        --// normal top and held forever — which reads as "suddenly super fast".
-        if int ~= Sprint.CandInt then
-            Sprint.CandInt, Sprint.CandAt = int, now
-        elseif Sprint.CandAt and (now - Sprint.CandAt) > 0.4 and int > 0.5 then
-            if Sprint.TopInt == nil or int > Sprint.TopInt + 0.01 then
-                Sprint.TopInt, Sprint.TopAt = int, now
-                if int > (Sprint.loggedTop or 0) + 0.25 then
-                    Sprint.loggedTop = int
-                    sLog(("sprint top: int_speed %.2f (WalkSpeed %.1f) — held for 0.4s"):format(int, ws))
+    --// a loadout swap changes the resting speed profile; confirm it over a few
+    --// frames (never mid-sprint) before throwing the measured top away
+    if not Sprint.ShiftDown and smod ~= nil then
+        if Sprint.RestMod == nil then
+            Sprint.RestMod = smod
+        elseif smod ~= Sprint.RestMod then
+            Sprint.modSeen = (Sprint.modSeen or 0) + 1
+            if Sprint.modSeen >= 3 then
+                Sprint.RestMod, Sprint.modSeen = smod, 0
+                if Sprint.TopWS then
+                    Sprint.TopWS = nil
+                    sLog("loadout speed profile changed — re-measuring your sprint top")
                 end
             end
+        else
+            Sprint.modSeen = 0
         end
     end
 
-    --// if we were writing until a moment ago and no longer are (Shift released,
-    --// chat focused, sprint blocked), hand the game's resting value back: the game
-    --// does not always rewrite int_speed when its own sprint state never engaged,
-    --// and leaving our value behind would look like a permanent speed boost
-    if st and Sprint.RestInt ~= nil and Sprint.lastWrite and (now - Sprint.lastWrite) < 0.6 then
-        pcall(rawset, st, "int_speed", Sprint.RestInt)
+    --// canHold: only ever hold a top we measured from a real sprint
+    local canHold = allowed and st and Sprint.WalkBase
+        and Sprint.TopWS and Sprint.TopWS > Sprint.WalkBase + 1
+
+    --// measure from the game's own sprint. Nothing we write can feed this: ws
+    --// only equals a hijacked value while canHold is true. The plateau (stable
+    --// for 0.25s) is the top — acting on a rising value is what used to cap the
+    --// player below his own sprint.
+    if not canHold and Sprint.ShiftDown and Sprint.WalkBase
+        and ws > Sprint.WalkBase + 1 and ws < 40 then
+        if not Sprint.CandWS or math.abs(ws - Sprint.CandWS) > 0.15 then
+            Sprint.CandWS, Sprint.CandAt = ws, now
+        elseif now - (Sprint.CandAt or 0) > 0.25 then
+            if not Sprint.TopWS then
+                sLog(("sprint top learned: %.2f st/s (rest %.2f) — Shift now jumps straight there")
+                    :format(ws, Sprint.WalkBase))
+                canHold = true --// just measured: this press is already instant
+            end
+            if not Sprint.TopWS or ws > Sprint.TopWS + 0.05 then Sprint.TopWS = ws end
+        end
     end
 
-    --// only act on a top that has settled — acting mid-ramp is what used to cap
-    --// the player below his own sprint speed
-    local settled = Sprint.TopInt and Sprint.TopInt > 0.5 and (now - (Sprint.TopAt or 0)) > 0.3
-    if not (allowed and st and settled) then
-        if Sprint.ShiftDown and allowed and not Sprint.learnNote then
+    if not canHold then
+        --// hand the game's own resting int back after a burst: it does not always
+        --// rewrite int_speed when its own sprint state never ran, and leaving our
+        --// value behind would read as a permanent speed boost
+        if st and Sprint.RestInt ~= nil and Sprint.lastWrite and (now - Sprint.lastWrite) < 0.5 then
+            pcall(rawset, st, "int_speed", Sprint.RestInt)
+        end
+        if Sprint.learnNote ~= true and Sprint.ShiftDown and allowed and not Sprint.TopWS then
             Sprint.learnNote = true
-            sLog("letting this sprint ramp once so it can measure your top")
+            sLog("measuring your sprint top on this press — every press after it is instant")
         end
         return
     end
     Sprint.learnNote = nil
     Sprint.lastBlock = nil
 
-    --// first write of a burst: remember the value the game itself had BEFORE we
-    --// touch it. Captured here (not on some earlier frame) so it can never be
-    --// raced away by the load-time table hunt — the release always hands it back.
-    if not Sprint.lastWrite or now - Sprint.lastWrite > 0.5 then
-        Sprint.RestInt = math.min(int or 0, Sprint.RestMin or int or 0)
-        sLog(("hijacking: game's own int_speed was %.2f, holding the top (%.2f) instead")
-            :format(int or -1, Sprint.TopInt))
+    --// first write of a burst: remember what the game itself had in there
+    if not Sprint.lastWrite or now - Sprint.lastWrite > 0.4 then
+        local _, int0 = stateRead(st)
+        Sprint.RestInt = math.max(0, tonumber(int0) or 0)
+        sLog(("holding: int_speed %.2f -> WalkSpeed %.2f (this loadout's own top)")
+            :format(Sprint.TopWS - Sprint.WalkBase, Sprint.TopWS))
     end
 
+    --// exactly the player's own top speed: WalkSpeed = base_speed + int_speed
+    local target = Sprint.TopWS - Sprint.WalkBase
+
     local ok, err = pcall(function()
-        rawset(st, "int_speed", Sprint.TopInt) --// the game's own top, instantly
-        rawset(st, "sprint_block", false)      --// no forced sprint breaks
-        rawset(st, "sprint_force_stop", 0)     --// no mid-run sprint kills
+        rawset(st, "int_speed", target)   --// the game's own top, instantly
+        rawset(st, "sprint_block", false) --// no forced sprint breaks
+        rawset(st, "sprint_force_stop", 0) --// no mid-run sprint kills
         rawset(st, "sprint_wall_stopper", 0)
     end)
     if not ok then
@@ -675,9 +699,9 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     end
     Sprint.Writes = Sprint.Writes + 1
     Sprint.lastWrite = now
-    if Sprint.Writes == 1 or Sprint.Writes % 240 == 0 then
-        sLog(("no-accel: int_speed %.2f + base %.1f = %.1f st/s — your own top, no ramp")
-            :format(Sprint.TopInt, base, base + Sprint.TopInt))
+    if Sprint.Writes == 1 or Sprint.Writes % 300 == 0 then
+        sLog(("no-accel: int_speed %.2f -> WalkSpeed %.2f (your own top, no ramp)")
+            :format(target, Sprint.TopWS))
     end
 end)
 
@@ -685,7 +709,7 @@ end)
 --// the new life is already instant (the profile check re-learns it if it changed)
 conns[#conns + 1] = LocalPlayer.CharacterAdded:Connect(function()
     Sprint.gdState = nil
-    Sprint.RestInt, Sprint.RestMin = nil, nil
+    Sprint.RestInt = nil
 end)
 
 local M = Tabs.Main
@@ -735,8 +759,8 @@ M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false
     Callback = function(v)
         Sprint.Enabled = v
         if v then
-            sLog("ENABLED —", Sprint.TopInt and (("sprint top int_speed %.2f known, Shift jumps straight to it")
-                :format(Sprint.TopInt)) or "no sprint seen yet — the next sprint measures your top, then every press is instant")
+            sLog("ENABLED —", Sprint.TopWS and (("your sprint top %.2f st/s is known, Shift jumps straight to it")
+                :format(Sprint.TopWS)) or "no sprint seen yet — the next sprint measures your top, then every press is instant")
         else
             sLog("DISABLED")
         end
@@ -782,7 +806,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v2.3 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v2.4 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient",        Content = "Gravedigger v2.3 — sprint ramp removed", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient",        Content = "Gravedigger v2.4 — sprint ramp removed", Duration = 3 })
 end)
