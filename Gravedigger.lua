@@ -568,7 +568,7 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
 
     if hum.Health <= 0 then
         Sprint.gdState = nil --// dead: this life's table is about to go stale
-        Sprint.RestInt = nil --// and the resting int belongs to that life
+        Sprint.RestInt, Sprint.RestMin = nil, nil --// and these belong to that life
         return
     end
 
@@ -606,6 +606,13 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
         end
         if not Sprint.ShiftDown and mod ~= nil then Sprint.RestMod = mod end
 
+        --// the game's own resting int_speed (0 on every real reading). Only
+        --// sampled well after we stopped writing, and kept as a minimum, so our
+        --// own leftover value can never be mistaken for the game's
+        if not Sprint.ShiftDown and (not Sprint.lastWrite or now - Sprint.lastWrite > 0.8) then
+            if Sprint.RestMin == nil or int < Sprint.RestMin then Sprint.RestMin = int end
+        end
+
         if Sprint.TopInt == nil or int > Sprint.TopInt + 0.01 then
             Sprint.TopInt, Sprint.TopAt = int, now
             if int > (Sprint.loggedTop or 0) + 0.5 then
@@ -640,7 +647,7 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     --// touch it. Captured here (not on some earlier frame) so it can never be
     --// raced away by the load-time table hunt — the release always hands it back.
     if not Sprint.lastWrite or now - Sprint.lastWrite > 0.5 then
-        Sprint.RestInt = int
+        Sprint.RestInt = math.min(int or 0, Sprint.RestMin or int or 0)
         sLog(("hijacking: game's own int_speed was %.2f, holding the top (%.2f) instead")
             :format(int or -1, Sprint.TopInt))
     end
@@ -671,7 +678,7 @@ end)
 --// the new life is already instant (the profile check re-learns it if it changed)
 conns[#conns + 1] = LocalPlayer.CharacterAdded:Connect(function()
     Sprint.gdState = nil
-    Sprint.RestInt = nil
+    Sprint.RestInt, Sprint.RestMin = nil, nil
 end)
 
 local M = Tabs.Main
