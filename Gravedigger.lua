@@ -389,6 +389,62 @@ getgenv().HamasGD_Probe = function()
 end
 
 --// ---------------------------------------------------------------------------
+--// Combat state — built HERE, above the UI, on purpose.
+--// Every toggle/slider/keybind callback below closes over these locals, and Fluent
+--// runs a keybind's ChangedCallback while the element is being CREATED. Declaring
+--// the table after the UI (as it used to be) made those callbacks write to a GLOBAL
+--// `Combat` that is nil, so the first click — or the aim key — threw
+--// "attempt to index nil with 'Key'" and every setting was silently ignored.
+--// ---------------------------------------------------------------------------
+local Combat = {
+    Aimbot = false, Silent = false, SilentAlways = true,
+    Key = Enum.KeyCode.E, Mode = "Hold", KeyDown = false, Toggled = false, Active = false,
+    Fov = 90, MaxDist = 700, Smooth = 0.2, Part = "Head", SilentPart = "Head",
+    Visible = true, Priority = "Crosshair", DrawFov = false,
+    SilentMethod = "Camera ray", Hitbox = 0,
+    Tracer = true, TracerAlways = false, TracerColor = Color3.fromRGB(120, 255, 140),
+    TracerTime = 0.4,
+    Target = nil, TargetPart = nil, SilentTarget = nil, SilentPart2 = nil,
+    Shots = 0, Writes = 0, Hook = nil,
+    --// diagnostics: with Watch on, every ray-ish method the game calls is counted,
+    --// so we can prove which call each weapon actually fires through
+    Watch = false, Seen = {},
+}
+getgenv().HamasGD_Combat = Combat
+
+local cLog
+do
+    local buf = {}
+    Combat.Log = buf
+    Combat.log = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+        buf[#buf + 1] = os.date("%H:%M:%S") .. " " .. table.concat(parts, " ")
+        if #buf > 30 then table.remove(buf, 1) end
+        print("[Hamas-Aim] " .. table.concat(parts, " "))
+        if Debug then Debug:Log("[Aim]", table.concat(parts, " ")) end
+    end
+end
+cLog = Combat.log
+
+local cam = workspace.CurrentCamera
+
+--// Fluent hands keybind values back in more than one shape: an EnumItem (Default)
+--// or a plain name string ("F", "LeftMousebutton") once it has been rebound or
+--// restored from a saved config. keyFrom() turns any of them into something we can
+--// compare against an InputObject.
+local function keyFrom(v)
+    if typeof(v) == "EnumItem" then return v end
+    if typeof(v) == "string" then
+        if v == "LeftMousebutton" then return Enum.UserInputType.MouseButton1 end
+        if v == "RightMousebutton" then return Enum.UserInputType.MouseButton2 end
+        local ok, k = pcall(function() return Enum.KeyCode[v] end)
+        if ok then return k end
+    end
+    return nil
+end
+
+--// ---------------------------------------------------------------------------
 --// Combat UI
 --// ---------------------------------------------------------------------------
 M:CreateSection("Combat — Aimbot")
@@ -396,15 +452,29 @@ M:CreateToggle("GD_Aimbot", { Title = "Aimbot (camera)", Default = false,
     Description = "Moves your camera onto the best enemy in your FOV. Silent aim does not need this.",
     Callback = function(v) Combat.Aimbot = v cLog("aimbot", v and "ON" or "OFF") end })
 
-local aimBind
-aimBind = M:AddKeybind("GD_AimKey", { Title = "Aim key", Default = Enum.KeyCode.E,
-    Description = "Click the box, then press a key or mouse button",
-    Callback = function(v) Combat.Key = v end })
-pcall(function()
-    if aimBind and aimBind.Value then Combat.Key = aimBind.Value end
-end)
+--// Fluent's keybind is quirky, and this is deliberate:
+--//   * Value holds a plain NAME ("E", "LeftMousebutton") once rebound, not an EnumItem
+--//   * its Callback fires with the TOGGLED STATE (true/false), never with the key;
+--//     Changed / ChangedCallback are the ones that receive the key.
+--// So the key is taken from the Changed hooks, normalised, and Mode="Always" stops
+--// the toggle-state Callback from ever overwriting it.
+local function onAimBind(v)
+    local k = keyFrom(v)
+    if k then Combat.Key = k end
+end
 
-M:CreateDropdown("GD_AimMode", { Title = "Key mode", Options = { "Hold", "Toggle" }, Default = "Hold",
+local aimBind
+aimBind = M:AddKeybind("GD_AimKey", { Title = "Aim key", Default = "E", Mode = "Always",
+    Description = "Click the box, then press a key or mouse button",
+    ChangedCallback = onAimBind })
+if aimBind then
+    --// the rebind path also calls the element's own Changed hook; leaving it nil
+    --// makes Fluent throw inside its InputEnded connection right after a rebind.
+    aimBind.Changed = onAimBind
+    onAimBind(aimBind.Value)
+end
+
+M:CreateDropdown("GD_AimMode", { Title = "Key mode", Values = { "Hold", "Toggle" }, Default = "Hold",
     Callback = function(v) Combat.Mode = v end })
 
 M:CreateSlider("GD_AimFov", { Title = "Aim FOV", Default = 90, Min = 1, Max = 360, Rounding = 0,
@@ -419,10 +489,10 @@ M:CreateSlider("GD_AimDist", { Title = "Max distance", Default = 700, Min = 50, 
     Callback = function(v) Combat.MaxDist = v end })
 
 M:CreateDropdown("GD_AimPart", { Title = "Aim part",
-    Options = { "Head", "UpperTorso", "HumanoidRootPart", "Nearest" }, Default = "Head",
+    Values = { "Head", "UpperTorso", "HumanoidRootPart", "Nearest" }, Default = "Head",
     Callback = function(v) Combat.Part = v end })
 
-M:CreateDropdown("GD_AimPriority", { Title = "Priority", Options = { "Crosshair", "Distance" },
+M:CreateDropdown("GD_AimPriority", { Title = "Priority", Values = { "Crosshair", "Distance" },
     Default = "Crosshair", Callback = function(v) Combat.Priority = v end })
 
 M:CreateToggle("GD_AimVisible", { Title = "Visible only", Default = true,
@@ -435,10 +505,15 @@ M:CreateToggle("GD_Silent", { Title = "Silent aim", Default = false,
     Callback = function(v)
         Combat.Silent = v
         if v then
-            if installSilentHook() then
+            --// Combat.install is the hook installer, which is defined further down
+            --// this file: reach it through the table rather than a not-yet-declared
+            --// local, otherwise this callback indexes a nil global.
+            local install = Combat.install
+            if install and install() then
                 cLog("silent aim ON — holding the top of the target")
             else
                 Combat.Silent = false
+                cLog("silent aim: could not install the ray hook — see console")
             end
         else
             cLog("silent aim OFF")
@@ -450,7 +525,7 @@ M:CreateToggle("GD_SilentAlways", { Title = "Silent aim always on", Default = tr
     Callback = function(v) Combat.SilentAlways = v end })
 
 M:CreateDropdown("GD_SilentPart", { Title = "Silent aim part",
-    Options = { "Head", "UpperTorso", "HumanoidRootPart", "Nearest" }, Default = "Head",
+    Values = { "Head", "UpperTorso", "HumanoidRootPart", "Nearest" }, Default = "Head",
     Description = "Nearest is the most forgiving: it uses whichever part of the enemy is closest to you",
     Callback = function(v) Combat.SilentPart = v end })
 
@@ -527,38 +602,6 @@ M:CreateButton({
 --// TRACER: every shot silent aim redirects draws a client-only neon beam from
 --// your muzzle to the enemy it was sent to, so you can see exactly who it picked.
 --// ===========================================================================
-local Combat = {
-    Aimbot = false, Silent = false, SilentAlways = true,
-    Key = Enum.KeyCode.E, Mode = "Hold", KeyDown = false, Toggled = false, Active = false,
-    Fov = 90, MaxDist = 700, Smooth = 0.2, Part = "Head", SilentPart = "Head",
-    Visible = true, Priority = "Crosshair", DrawFov = false,
-    SilentMethod = "Camera ray", Hitbox = 0,
-    Tracer = true, TracerAlways = false, TracerColor = Color3.fromRGB(120, 255, 140),
-    TracerTime = 0.4,
-    Target = nil, TargetPart = nil, SilentTarget = nil, SilentPart2 = nil,
-    Shots = 0, Writes = 0, Hook = nil,
-    --// diagnostics: with Watch on, every ray-ish method the game calls is counted,
-    --// so we can prove which call each weapon actually fires through
-    Watch = false, Seen = {},
-}
-getgenv().HamasGD_Combat = Combat
-
-do
-    local buf = {}
-    Combat.Log = buf
-    Combat.log = function(...)
-        local parts = {}
-        for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
-        buf[#buf + 1] = os.date("%H:%M:%S") .. " " .. table.concat(parts, " ")
-        if #buf > 30 then table.remove(buf, 1) end
-        print("[Hamas-Aim] " .. table.concat(parts, " "))
-        if Debug then Debug:Log("[Aim]", table.concat(parts, " ")) end
-    end
-end
-local cLog = Combat.log
-
-local cam = workspace.CurrentCamera
-
 --// pick the part we aim at. "Nearest" = the closest base part on that fighter,
 --// which is the most forgiving target for silent aim.
 local function partFor(m, which)
@@ -774,6 +817,10 @@ Combat.install, Combat.remove, Combat.pickTarget = installSilentHook, removeSile
 --// ---------------------------------------------------------------------------
 local lastPreview = 0
 conns[#conns + 1] = RunService.RenderStepped:Connect(function(dt)
+    --// the camera instance is replaced on some respawns; every helper reads this upvalue
+    local cur = workspace.CurrentCamera
+    if cur and cur ~= cam then cam = cur end
+    if not cam then return end --// no camera yet: helpers below would index nil
     Combat.Active = (Combat.Mode == "Toggle") and Combat.Toggled or Combat.KeyDown
 
     local typing = UserInputService:GetFocusedTextBox() ~= nil
@@ -817,7 +864,14 @@ end)
 --// key tracking for the aim key (hold or toggle), chat-safe
 --// ---------------------------------------------------------------------------
 local function isAimInput(input)
-    return input.KeyCode == Combat.Key or input.UserInputType == Combat.Key
+    local k = Combat.Key
+    if typeof(k) ~= "EnumItem" then
+        --// a restored config can hand us a plain name; heal it into an EnumItem
+        k = keyFrom(k)
+        if k then Combat.Key = k end
+    end
+    if not k then return false end
+    return input.KeyCode == k or input.UserInputType == k
 end
 conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
     if gp or not isAimInput(input) then return end
