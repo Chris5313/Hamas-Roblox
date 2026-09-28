@@ -38,6 +38,16 @@
 --// their write), plus a Heartbeat backup enforcer. Every state change and every
 --// win/loss against the game is logged to console, the debug log, and a rolling
 --// buffer at getgenv().HamasGD_Sprint.Log.
+--//
+--// v1.7: DIRECT DRIVE — instrumented runs proved WalkSpeed pinning alone fights
+--// the game's own velocity controller (WalkSpeed steady 16 while actual velocity
+--// bounced 11-29 st/s = two systems wrestling). v1.7 becomes the propulsion:
+--// while Shift is held we drive HumanoidRootPart.AssemblyLinearVelocity straight
+--// at the target speed along MoveDirection every Heartbeat (the AOT-proven
+--// pattern). WalkSpeed stays pinned so sprint animations trigger. No ramp can
+--// survive that — the character physically moves at target speed the frame you
+--// press. Peak speeds are recorded per sprint (Sprint.peakWS / Sprint.peakSP)
+--// so a later check shows exactly what your run did.
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -66,7 +76,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.6",
+        Version = "1.7",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -333,7 +343,8 @@ getgenv().HamasGD_ESP = ESP
 --//   * real Shift key tracking (InputBegan/InputEnded, chat-aware)
 --//   * EVERYTHING logged: console + debug log + getgenv().HamasGD_Sprint.Log
 --// ===========================================================================
-local Sprint = { Enabled = false, Target = 16, Overrides = 0, ShiftDown = false }
+local Sprint = { Enabled = false, Target = 16, Overrides = 0, ShiftDown = false,
+    peakWS = 0, peakSP = 0 }
 getgenv().HamasGD_Sprint = Sprint
 
 local sprintLog = {}
@@ -401,18 +412,37 @@ conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
---// backup enforcer (covers ramp writes between signal hops). v1.6.1: when Shift
---// is held but sprint CAN'T run, log exactly why — once per distinct reason, so
---// a silent failure can never hide again.
+--// backup enforcer + DIRECT DRIVE (v1.7): we no longer depend on the game's
+--// WalkSpeed consumer at all — while Shift is held the character is driven at
+--// target speed along MoveDirection every Heartbeat. Vertical velocity and
+---- everything else is preserved. WalkSpeed stays pinned so animations follow.
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if Sprint.ShiftDown then
         local ok, humOrWhy = sprintAllowed()
         if ok then
+            local hum = humOrWhy
             Sprint.lastBlock = nil
-            enforce(humOrWhy)
+            enforce(hum)
+            local ch = hum.Parent
+            local hrp = ch and (ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart)
+            if hrp and not hrp.Anchored then
+                local md = hum.MoveDirection
+                if md.Magnitude > 0.05 then
+                    local v = hrp.AssemblyLinearVelocity
+                    hrp.AssemblyLinearVelocity = Vector3.new(md.Unit.X * Sprint.Target, v.Y, md.Unit.Z * Sprint.Target)
+                    local sp = Vector3.new(md.Unit.X, 0, md.Unit.Z).Magnitude * Sprint.Target
+                    if sp > Sprint.peakSP then Sprint.peakSP = math.floor(sp * 10) / 10 end
+                end
+            end
+            if hum.WalkSpeed > Sprint.peakWS then Sprint.peakWS = math.floor(hum.WalkSpeed * 10) / 10 end
         elseif humOrWhy ~= Sprint.lastBlock then
             Sprint.lastBlock = humOrWhy
             sLog("Shift held but sprint BLOCKED:", humOrWhy)
+        end
+    else
+        if Sprint.peakSP > 0 then
+            sLog("sprint ended — peak WS", Sprint.peakWS, "| peak speed", Sprint.peakSP)
+            Sprint.peakWS, Sprint.peakSP = 0, 0
         end
     end
 end)
@@ -518,7 +548,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.6.1 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.7 loaded, place:", game.PlaceId)
 pcall(function()
     Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.6 loaded — ESP + sprint watchdog", Duration = 3 })
 end)
