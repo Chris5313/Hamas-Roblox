@@ -481,6 +481,23 @@ M:CreateButton({
     end,
 })
 
+M:CreateToggle("GD_RayWatch", { Title = "Debug: count ray methods", Default = false,
+    Description = "Counts the ray-related calls the game makes (use it to confirm which one a new gun uses)",
+    Callback = function(v) Combat.Watch = v end })
+
+M:CreateButton({
+    Title = "Print ray method counts",
+    Description = "Lists every ray/point call seen while the counter above was on",
+    Callback = function()
+        local n = 0
+        for m, c in pairs(Combat.Seen) do
+            cLog("ray method:", m, "x" .. tostring(c))
+            n = n + 1
+        end
+        if n == 0 then cLog("no ray methods seen yet — turn the counter on and fire a weapon") end
+    end,
+})
+
 M:CreateButton({
     Title = "Show current target (console + log)",
     Description = "Prints the enemy aim and silent aim have locked right now",
@@ -520,6 +537,9 @@ local Combat = {
     TracerTime = 0.4,
     Target = nil, TargetPart = nil, SilentTarget = nil, SilentPart2 = nil,
     Shots = 0, Writes = 0, Hook = nil,
+    --// diagnostics: with Watch on, every ray-ish method the game calls is counted,
+    --// so we can prove which call each weapon actually fires through
+    Watch = false, Seen = {},
 }
 getgenv().HamasGD_Combat = Combat
 
@@ -694,8 +714,14 @@ local function installSilentHook()
     local old = mt.__namecall
     Combat.Hook = old
     local hooked = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if Combat.Watch then
+            local lc = string.lower(method)
+            if string.find(lc, "ray", 1, true) or string.find(lc, "point", 1, true) then
+                Combat.Seen[method] = (Combat.Seen[method] or 0) + 1
+            end
+        end
         if Combat.Silent and Combat.SilentPart2 then
-            local method = getnamecallmethod()
             if SILENT_METHODS[method] then
                 local ok, res, did = pcall(silentRedirect, old, method, self, Combat.SilentPart2, ...)
                 if ok and did then
