@@ -349,11 +349,12 @@ local function sLog(...)
 end
 
 local function sprintAllowed()
-    if not Sprint.Enabled then return false end
-    if UserInputService:GetFocusedTextBox() then return false end
+    if not Sprint.Enabled then return false, "disabled" end
+    if UserInputService:GetFocusedTextBox() then return false, "chat-focus" end
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return false end
+    if not hum then return false, "no-humanoid (dead/menu?)" end
+    if hum.Health <= 0 then return false, "dead (hp 0)" end
     return true, hum
 end
 
@@ -400,10 +401,20 @@ conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
---// backup enforcer (covers ramp writes between signal hops)
+--// backup enforcer (covers ramp writes between signal hops). v1.6.1: when Shift
+--// is held but sprint CAN'T run, log exactly why — once per distinct reason, so
+--// a silent failure can never hide again.
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
-    local ok, hum = sprintAllowed()
-    if ok and Sprint.ShiftDown then enforce(hum) end
+    if Sprint.ShiftDown then
+        local ok, humOrWhy = sprintAllowed()
+        if ok then
+            Sprint.lastBlock = nil
+            enforce(humOrWhy)
+        elseif humOrWhy ~= Sprint.lastBlock then
+            Sprint.lastBlock = humOrWhy
+            sLog("Shift held but sprint BLOCKED:", humOrWhy)
+        end
+    end
 end)
 
 local M = Tabs.Main
@@ -507,7 +518,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.6 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.6.1 loaded, place:", game.PlaceId)
 pcall(function()
     Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.6 loaded — ESP + sprint watchdog", Duration = 3 })
 end)
