@@ -29,6 +29,15 @@
 --// a legit fully-ramped sprinter. Heartbeat loop pins it while Shift is down;
 --// on release the game's own instant reset to 10 runs untouched. Nothing is
 --// written while you're typing in chat.
+--//
+--// v1.6: SPRINT WATCHDOG v2 — v1.5 pinned WalkSpeed on Heartbeat and LOST the
+--// race: the game's ramp loop writes WalkSpeed in the same frame (likely after
+--// us), so the pin was invisible. v1.6 stops racing and wins by construction:
+--// a per-character WalkSpeed CHANGED hook stamps the speed back to target the
+--// instant the game's loop writes it (signal handlers run synchronously after
+--// their write), plus a Heartbeat backup enforcer. Every state change and every
+--// win/loss against the game is logged to console, the debug log, and a rolling
+--// buffer at getgenv().HamasGD_Sprint.Log.
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -57,7 +66,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.5",
+        Version = "1.6",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -317,23 +326,84 @@ end
 getgenv().HamasGD_ESP = ESP
 
 --// ===========================================================================
---// v1.5 NO-ACCELERATION SPRINT — pin WalkSpeed to sprint target while Shift is
---// held. The game's own ramp loop (10 -> 16 over ~2s) gets overwritten at 60 Hz,
---// so you hit full sprint the frame you press. Walk speed is NEVER written on
---// release — the game resets it to 10 instantly by itself. Cap stays at 16 (the
---// legit sprint max) so server-side position checks see nothing unusual.
+--// v1.6 NO-ACCELERATION SPRINT (watchdog v2)
+--//   * per-character WalkSpeed CHANGED hook — the game's ramp write is undone
+--//     synchronously, no matter which loop runs first
+--//   * Heartbeat backup enforcer for anything the hook can miss
+--//   * real Shift key tracking (InputBegan/InputEnded, chat-aware)
+--//   * EVERYTHING logged: console + debug log + getgenv().HamasGD_Sprint.Log
 --// ===========================================================================
-local Sprint = { Enabled = false, Target = 16 }
+local Sprint = { Enabled = false, Target = 16, Overrides = 0, ShiftDown = false }
+getgenv().HamasGD_Sprint = Sprint
 
-conns[#conns + 1] = RunService.Heartbeat:Connect(function()
-    if not Sprint.Enabled then return end
-    if UserInputService:GetFocusedTextBox() then return end -- typing in chat: hands off
+local sprintLog = {}
+Sprint.Log = sprintLog
+local function sLog(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+    local line = os.date("%H:%M:%S") .. " " .. table.concat(parts, " ")
+    sprintLog[#sprintLog + 1] = line
+    if #sprintLog > 40 then table.remove(sprintLog, 1) end
+    print("[Hamas-Sprint] " .. table.concat(parts, " "))
+    if Debug then Debug:Log("[Sprint]", table.concat(parts, " ")) end
+end
+
+local function sprintAllowed()
+    if not Sprint.Enabled then return false end
+    if UserInputService:GetFocusedTextBox() then return false end
     local ch = LocalPlayer.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-    if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+    if not hum or hum.Health <= 0 then return false end
+    return true, hum
+end
+
+local function enforce(hum)
+    if hum.WalkSpeed < Sprint.Target then
+        local had = hum.WalkSpeed
         hum.WalkSpeed = Sprint.Target
+        Sprint.Overrides = Sprint.Overrides + 1
+        if Sprint.Overrides <= 5 or Sprint.Overrides % 60 == 0 then
+            sLog("override #" .. Sprint.Overrides .. ": game wrote "
+                .. math.floor(had * 10) / 10 .. " -> pinned " .. Sprint.Target)
+        end
     end
+end
+
+--// per-character watchdog: fires the moment ANY code writes WalkSpeed
+local function watchCharacter(ch)
+    local hum = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 10)
+    if not hum then sLog("watch: no Humanoid on", ch.Name) return end
+    sLog("watching", ch.Name, "| WalkSpeed", hum.WalkSpeed)
+    conns[#conns + 1] = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if Sprint.ShiftDown and sprintAllowed() then
+            enforce(hum)
+        end
+    end)
+end
+
+conns[#conns + 1] = LocalPlayer.CharacterAdded:Connect(function(ch)
+    task.spawn(watchCharacter, ch)
+end)
+if LocalPlayer.Character then task.spawn(watchCharacter, LocalPlayer.Character) end
+
+--// real Shift tracking (gameProcessed = typing in chat / UI has focus)
+conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
+    if input.KeyCode == Enum.KeyCode.LeftShift then
+        Sprint.ShiftDown = not gp
+        if Sprint.Enabled then sLog("Shift DOWN -> pinning WalkSpeed to", Sprint.Target) end
+    end
+end)
+conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.LeftShift then
+        Sprint.ShiftDown = false
+        if Sprint.Enabled then sLog("Shift UP -> game resets speed itself") end
+    end
+end)
+
+--// backup enforcer (covers ramp writes between signal hops)
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+    local ok, hum = sprintAllowed()
+    if ok and Sprint.ShiftDown then enforce(hum) end
 end)
 
 local M = Tabs.Main
@@ -379,8 +449,20 @@ end
 
 M:CreateSection("Movement")
 M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false,
-    Description = "Full sprint speed the instant you press Shift — skips the ~2s ramp",
-    Callback = function(v) Sprint.Enabled = v end })
+    Description = "Full sprint speed the instant you press Shift — skips the ~2s ramp (logs to console)",
+    Callback = function(v)
+        Sprint.Enabled = v
+        if v then
+            sLog("ENABLED — hold LeftShift, pinning WalkSpeed to", Sprint.Target)
+            if not Sprint.ShiftDown then sLog("note: Shift not held yet — press LeftShift to sprint") end
+            local ch = LocalPlayer.Character
+            if ch and not ch:FindFirstChildOfClass("Humanoid") then
+                sLog("note: current character has NO Humanoid — respawn may be needed")
+            end
+        else
+            sLog("DISABLED")
+        end
+    end })
 M:CreateSlider("GD_SprintSpeed", { Title = "Sprint speed (16 = legit max)", Default = 16, Min = 10, Max = 16, Rounding = 0,
     Description = "16 is what a fully-ramped sprint reaches — stays identical to a legit sprinter on the server",
     Callback = function(v) Sprint.Target = v end })
@@ -425,7 +507,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.5 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.6 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.5 loaded — ESP + no-accel sprint", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.6 loaded — ESP + sprint watchdog", Duration = 3 })
 end)
