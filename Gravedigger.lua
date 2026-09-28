@@ -498,14 +498,20 @@ local function refreshState()
 end
 refreshState()
 
+--// one field off the game's state table (pcall'd: the proxy throws on unknown keys)
+local function stateField(name)
+    local st = Sprint.gdState
+    if not st then return nil end
+    local ok, v = pcall(rawget, st, name)
+    if not ok then return nil end
+    return tonumber(v)
+end
+
 --// base_speed = the flat walking component of the game's speed model.
 --// WalkSpeed = base_speed + int_speed  =>  int_speed = wanted - base_speed.
 local function baseSpeed()
-    local st = Sprint.gdState
-    if not st then return nil end
-    local ok, b = pcall(rawget, st, "base_speed")
-    b = tonumber(b)
-    return (ok and b and b > 0) and b or nil
+    local b = stateField("base_speed")
+    return (b and b > 0) and b or nil
 end
 
 --// THE FIX: RunService.PreSimulation fires immediately before the physics step,
@@ -528,14 +534,37 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
 
     local st = Sprint.gdState
     local base = baseSpeed()
-    if not (allowed and st and base and Sprint.Peak and Sprint.Peak > base) then
+    local now = os.clock()
+
+    --// the state table is a proxy that refreshes lazily: if we lost it, scavenge
+    --// again — but never more than every couple of seconds (getgc is a full scan)
+    if not st and (not Sprint.lastHunt or now - Sprint.lastHunt > 2) then
+        Sprint.lastHunt = now
+        st = refreshState()
+        base = baseSpeed()
+    end
+
+    --// base_speed moved => different speed profile (class/loadout), so the learned
+    --// top no longer describes this character. Forget it and re-learn instead of
+    --// pinning a number that could sit below the real sprint speed.
+    if base and Sprint.Base and math.abs(base - Sprint.Base) > 0.01 then
+        Sprint.Peak, Sprint.PeakAt = nil, nil
+        sLog("speed profile changed — re-learning your sprint top")
+    end
+
+    --// never act on a peak we just watched rise: that means the game is still
+    --// ramping, so the value we hold is not the top yet. Acting there is exactly
+    --// what used to brake the player below his own sprint.
+    local settled = Sprint.Peak and (now - (Sprint.PeakAt or 0)) > 0.35
+
+    if not (allowed and st and base and settled and Sprint.Peak > base) then
         --// not overriding anything: whatever WalkSpeed the game settles on IS its
         --// sprint top, so remember the highest we ever see. We write nothing on
         --// this path, so we can never learn our own value.
         if hum.Health > 0 then
             local ws = hum.WalkSpeed
             if ws > (Sprint.Peak or 0) + 0.01 then
-                Sprint.Peak = ws
+                Sprint.Peak, Sprint.PeakAt, Sprint.Base = ws, now, base
                 if ws - (base or 10) > 1 then
                     sLog(("sprint top learned: %.1f st/s — Shift now jumps straight there"):format(ws))
                 end
