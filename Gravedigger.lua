@@ -75,6 +75,16 @@
 --// character hard along MoveDirection (replacing the 2s ramp with ~0.5s), then
 --// hands back to the game's own controller for top speed. Braking is now
 --// impossible by construction; top speed is always the game's own.
+--//
+--// v2.1: STATE HIJACK — found the game's per-player state table via getgc
+--// upvalue hunting: ONE table in the heap with sprint_ticker (a tick() stamp),
+--// int_speed (THE ramp: base_speed 10 + int_speed 0->6 over ~2s), sprint_block,
+--// sprint_force_stop and sprint_wall_stopper (timestamp force-stops = the
+--// annoying mid-run sprint kills). v2.1 writes that table directly every frame
+--// while Shift is held: int_speed pinned to max (+ bonus slider), force-stop
+--// fields zeroed. The game's own MainLoop consumes our values — we feed the
+--// machine instead of fighting it. The velocity launch is gone (obsolete —
+--// the game re-positions every frame); WalkSpeed pin stays for animations.
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -103,7 +113,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "2.0",
+        Version = "2.1",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -444,49 +454,84 @@ conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
---// RAMP KILLER (v2.0): on Shift press, 0.6s power-launch along MoveDirection,
---// then hand back to the game's own speed controller. NEVER caps or brakes.
-local vSet, boostT, wasDown = 0, 0, false
-conns[#conns + 1] = RunService.Heartbeat:Connect(function()
-    if Sprint.ShiftDown and not wasDown then
-        boostT = 0
-        sLog("launch: ramp killed — full speed in ~0.5s")
+--// STATE HIJACK (v2.1): find the game's per-player state table (single table in
+--// the GC with sprint_ticker + sprinting_max_speed keys) and write its ramp and
+--// force-stop fields directly while Shift is held.
+local function findGDState()
+    local found
+    for _, f in ipairs(getgc(true)) do
+        if found then break end
+        if type(f) == "function" then
+            local ok, uvs = pcall(getupvalues, f)
+            if ok and uvs then
+                for _, v in ipairs(uvs) do
+                    if typeof(v) == "table" then
+                        local okT = pcall(function()
+                            return v.sprint_ticker ~= nil and v.sprinting_max_speed ~= nil
+                                and v.int_speed ~= nil
+                        end)
+                        if okT then
+                            local probe = false
+                            pcall(function() probe = rawget(v, "sprint_ticker") ~= nil or rawget(v, "sprint_ticker") == nil end)
+                            -- prefer rawget hit; tables with metatables still expose keys via pairs on the proxy
+                            local n = 0
+                            pcall(function() for _ in pairs(v) do n = n + 1 end end)
+                            if n > 40 then found = v; break end
+                        end
+                    end
+                end
+            end
+        end
     end
-    wasDown = Sprint.ShiftDown
+    return found
+end
+
+Sprint.gdState = nil
+local function refreshState()
+    local st = findGDState()
+    if st and st ~= Sprint.gdState then
+        Sprint.gdState = st
+        sLog("state table captured — feeding the game's own sprint machine")
+    end
+    return Sprint.gdState
+end
+refreshState()
+
+--// natural ramp max: base_speed 10 + int_speed 6 = 16 (measured flat top).
+local INT_MAX = 6
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if Sprint.ShiftDown then
         local ok, humOrWhy = sprintAllowed()
         if ok then
-            local hum = humOrWhy
             Sprint.lastBlock = nil
-            enforce(hum)
-            local ch = hum.Parent
-            local hrp = ch and (ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart)
-            if hrp and not hrp.Anchored then
-                local md = hum.MoveDirection
-                if md.Magnitude > 0.05 then
-                    local dtU = Sprint._dt or 0.016
-                    if boostT < 0.6 then
-                        boostT = boostT + dtU
-                        vSet = math.min(vSet + 55 * dtU, (Sprint.Learned or 22) + (Sprint.Bonus or 0) + 3)
-                        local v = hrp.AssemblyLinearVelocity
-                        hrp.AssemblyLinearVelocity = Vector3.new(md.Unit.X * vSet, v.Y, md.Unit.Z * vSet)
-                    else
-                        vSet = 0 -- handoff: the game owns top speed again
-                    end
-                else
-                    vSet = 0
+            enforce(humOrWhy) -- WalkSpeed pin keeps sprint animations correct
+            local st = Sprint.gdState or refreshState()
+            if st then
+                local okW, errW = pcall(function()
+                    rawset(st, "int_speed", INT_MAX + (Sprint.Bonus or 0)) -- ramp skipped: full bonus NOW
+                    rawset(st, "sprint_block", false)                      -- no forced sprint breaks
+                    rawset(st, "sprint_force_stop", 0)
+                    rawset(st, "sprint_wall_stopper", 0)
+                end)
+                if not okW and errW ~= Sprint.lastWriteErr then
+                    Sprint.lastWriteErr = errW
+                    sLog("state write failed:", tostring(errW))
+                    Sprint.gdState = nil -- stale table (respawned) — re-hunt next frame
                 end
             end
         elseif humOrWhy ~= Sprint.lastBlock then
             Sprint.lastBlock = humOrWhy
             sLog("Shift held but sprint BLOCKED:", humOrWhy)
         end
-    else
-        vSet, boostT = 0, 0
     end
 end)
--- track real dt for the integrator
-conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt) Sprint._dt = dt end)
+
+--// re-hunt the state table whenever a fresh character spawns (old table dies)
+conns[#conns + 1] = LocalPlayer.CharacterAdded:Connect(function()
+    Sprint.gdState = nil
+    task.delay(2, refreshState)
+end)
 
 local M = Tabs.Main
 M:CreateSection("Gravedigger")
@@ -546,8 +591,8 @@ M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false
             sLog("DISABLED")
         end
     end })
-M:CreateSlider("GD_SprintSpeed", { Title = "Launch strength", Default = 0, Min = 0, Max = 10, Rounding = 0,
-    Description = "Extra speed during the 0.6s launch only. Top speed is always your game's own — this never caps you.",
+M:CreateSlider("GD_SprintSpeed", { Title = "Sprint bonus", Default = 0, Min = 0, Max = 10, Rounding = 0,
+    Description = "Extra sprint speed, applied through the game's own speed system (0 = exactly a full legit sprint, instantly).",
     Callback = function(v) Sprint.Bonus = v end })
 
 M:CreateSection("Gravedigger")
@@ -590,7 +635,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v2.0 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v2.1 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v2.0 — sprint ramp killer", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v2.1 — sprint state hijack", Duration = 3 })
 end)
