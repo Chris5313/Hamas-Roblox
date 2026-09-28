@@ -18,6 +18,17 @@
 --// ESP.IsAlive (engine v1.4) re-checks every tracked box per frame — the moment
 --// a model dies (Humanoid 0), is renamed *_ragdoll or filed under bodies/
 --// notarget, its box vanishes that frame. No more boxes on the dead.
+--//
+--// v1.5: NO-ACCELERATION SPRINT — measured the live sprint system by driving real
+--// W/Shift input through VirtualInputManager and sampling WalkSpeed at 10 Hz:
+--//   walk = 10, sprint ramps 10 -> 16 over ~2s, release snaps back instantly.
+--// That ramp IS the annoying "acceleration". The whole system is a client loop
+--// writing hum.WalkSpeed (no stamina attributes, no custom physics, speed ==
+--// WalkSpeed in every sample), and the server only sees your position — so
+--// pinning WalkSpeed to 16 while Shift is held is byte-identical on the wire to
+--// a legit fully-ramped sprinter. Heartbeat loop pins it while Shift is down;
+--// on release the game's own instant reset to 10 runs untouched. Nothing is
+--// written while you're typing in chat.
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -46,7 +57,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.4",
+        Version = "1.5",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -61,6 +72,8 @@ end
 local Fluent, Window, Tabs, Debug, SaveManager = ctx.Fluent, ctx.Window, ctx.Tabs, ctx.Debug, ctx.SaveManager
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
 local ESP = getgenv().HamasLoad("HamasESP.lua")
@@ -304,10 +317,27 @@ end
 getgenv().HamasGD_ESP = ESP
 
 --// ===========================================================================
---// Probe — dumps every top-level model with keep/skip + reason, plus players
---// and the workspace layout. Console AND debug log. Used to re-verify the
---// faction folders if the game updates its spawn layout.
+--// v1.5 NO-ACCELERATION SPRINT — pin WalkSpeed to sprint target while Shift is
+--// held. The game's own ramp loop (10 -> 16 over ~2s) gets overwritten at 60 Hz,
+--// so you hit full sprint the frame you press. Walk speed is NEVER written on
+--// release — the game resets it to 10 instantly by itself. Cap stays at 16 (the
+--// legit sprint max) so server-side position checks see nothing unusual.
 --// ===========================================================================
+local Sprint = { Enabled = false, Target = 16 }
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+    if not Sprint.Enabled then return end
+    if UserInputService:GetFocusedTextBox() then return end -- typing in chat: hands off
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+        hum.WalkSpeed = Sprint.Target
+    end
+end)
+
+local M = Tabs.Main
+M:CreateSection("Gravedigger")
 local function probeDump(say)
     say("LocalPlayer:", LocalPlayer.Name, "| Team:", myTeamName() or "none")
     for _, pl in ipairs(Players:GetPlayers()) do
@@ -347,7 +377,14 @@ local function probeDump(say)
     end
 end
 
-local M = Tabs.Main
+M:CreateSection("Movement")
+M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false,
+    Description = "Full sprint speed the instant you press Shift — skips the ~2s ramp",
+    Callback = function(v) Sprint.Enabled = v end })
+M:CreateSlider("GD_SprintSpeed", { Title = "Sprint speed (16 = legit max)", Default = 16, Min = 10, Max = 16, Rounding = 0,
+    Description = "16 is what a fully-ramped sprint reaches — stays identical to a legit sprinter on the server",
+    Callback = function(v) Sprint.Target = v end })
+
 M:CreateSection("Gravedigger")
 M:CreateButton({
     Title = "Model probe (console + log)",
@@ -388,7 +425,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.4 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.5 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.4 loaded — ESP first", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.5 loaded — ESP + no-accel sprint", Duration = 3 })
 end)
