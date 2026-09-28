@@ -11,6 +11,9 @@
 --// the filters can be tightened to the game's REAL team field on the next pass.
 --//
 --// v1.0: initial build — UI scaffold, Enemies/Team ESP, model probe.
+--// v1.2: LOAD FIX — `m:GetAttribute` (method access without a call) is a syntax
+--// error in Luau too, so loadstring returned nil and the executor printed
+--// "attempt to call a nil value" on the loader line. Plain GetAttribute calls now.
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -39,7 +42,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.0",
+        Version = "1.2",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -84,9 +87,9 @@ end
 --// read a team id off a custom model, or nil when it carries none. The probe
 --// dump tells us which of these the game actually uses; all of them are cheap.
 local function teamKeyOf(m)
-    local attr = m:GetAttribute and m:GetAttribute("Team")
+    local attr = m:GetAttribute("Team")
     if attr ~= nil then return "attr:" .. tostring(attr) end
-    attr = m:GetAttribute and m:GetAttribute("TeamName")
+    attr = m:GetAttribute("TeamName")
     if attr ~= nil then return "attr:" .. tostring(attr) end
     for _, pl in ipairs(Players:GetPlayers()) do
         if m.Name == pl.Name then
@@ -271,7 +274,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.1 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.2 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.1 loaded — ESP first", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.2 loaded — ESP first", Duration = 3 })
 end)

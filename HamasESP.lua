@@ -252,7 +252,7 @@ local function eligible(inst, def)
         local ok, res = pcall(def.Filter, inst)
         if not ok then
             -- a broken filter must never kill the rescan: log it (max 5x) and skip
-            filterErrors += 1
+            filterErrors = filterErrors + 1
             if filterErrors <= 5 then
                 warn("[ESP] filter error in '" .. tostring(def.Name) .. "': " .. tostring(res))
             end
@@ -339,7 +339,7 @@ local function rescan()
                         ESP.Tracked[c.inst] = { def = def, data = cacheEntity(c.inst),
                             draws = draws, kinds = kinds, classes = classes }
                     end
-                    taken += 1
+                    taken = taken + 1
                 end
             end
         end
@@ -348,7 +348,7 @@ local function rescan()
         for _, def in ipairs(collectors) do
             local ok, list = pcall(def.Collect, camPos, maxDist)
             if not ok then
-                filterErrors += 1
+                filterErrors = filterErrors + 1
                 if filterErrors <= 5 then
                     warn("[ESP] collect error in '" .. tostring(def.Name) .. "': " .. tostring(list))
                 end
@@ -375,7 +375,7 @@ local function rescan()
                             ESP.Tracked[inst] = { def = def, data = cacheEntity(inst),
                                 draws = draws, kinds = kinds, classes = classes }
                         end
-                        taken += 1
+                        taken = taken + 1
                     end
                 end
             end
@@ -383,7 +383,7 @@ local function rescan()
     end
 
     local n = 0
-    for _ in pairs(ESP.Tracked) do n += 1 end
+    for _ in pairs(ESP.Tracked) do n = n + 1 end
     ESP.Stats.tracked = n
 end
 
@@ -506,7 +506,7 @@ function ESP:Init(cfg)
             ESP.Stats.drawn = 0
             return
         end
-        rescanTimer += dt
+        rescanTimer = rescanTimer + dt
         if rescanTimer >= C.RescanInterval then
             rescanTimer = 0
             rescan()
@@ -521,13 +521,13 @@ function ESP:Init(cfg)
                 --// real message, the rest are silent until a rescan fixes them
                 local okU, errU = pcall(updateOne, entity, rec)
                 if not okU then
-                    updateErrors += 1
+                    updateErrors = updateErrors + 1
                     if updateErrors <= 5 then
                         warn("[ESP] update error on '" .. tostring(entity.Name) .. "': " .. tostring(errU))
                     end
                     hideOne(rec)
                 else
-                    drawn += 1
+                    drawn = drawn + 1
                 end
             end
         end
