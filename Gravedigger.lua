@@ -613,11 +613,18 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
             if Sprint.RestMin == nil or int < Sprint.RestMin then Sprint.RestMin = int end
         end
 
-        if Sprint.TopInt == nil or int > Sprint.TopInt + 0.01 then
-            Sprint.TopInt, Sprint.TopAt = int, now
-            if int > (Sprint.loggedTop or 0) + 0.5 then
-                Sprint.loggedTop = int
-                sLog(("sprint top: int_speed %.2f (WalkSpeed %.1f)"):format(int, ws))
+        --// a top only counts once the game has HELD that value for 0.4s. Without
+        --// this, a momentary spike (charge/dash/perk) would be latched as the new
+        --// normal top and held forever — which reads as "suddenly super fast".
+        if int ~= Sprint.CandInt then
+            Sprint.CandInt, Sprint.CandAt = int, now
+        elseif Sprint.CandAt and (now - Sprint.CandAt) > 0.4 and int > 0.5 then
+            if Sprint.TopInt == nil or int > Sprint.TopInt + 0.01 then
+                Sprint.TopInt, Sprint.TopAt = int, now
+                if int > (Sprint.loggedTop or 0) + 0.25 then
+                    Sprint.loggedTop = int
+                    sLog(("sprint top: int_speed %.2f (WalkSpeed %.1f) — held for 0.4s"):format(int, ws))
+                end
             end
         end
     end
