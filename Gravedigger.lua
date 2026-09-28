@@ -591,21 +591,35 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     local st = Sprint.gdState
     local smod
 
-    --// keep the cached table honest (identity: base + int == WalkSpeed)
-    if st then
+    --// verify the cached table ONLY while the key is up. Checking during a sprint
+    --// is what kept throwing the table away: its reads lag the game's own ramp, so
+    --// base + int does not equal WalkSpeed for a few frames and the check panicked.
+    if st and not Sprint.ShiftDown then
         local base, int, m = stateRead(st)
         smod = m
         if base and int and math.abs((base + int) - ws) < 1.5 then
             Sprint.badChecks = 0
         else
             Sprint.badChecks = (Sprint.badChecks or 0) + 1
-            if Sprint.badChecks > 20 then
+            if Sprint.badChecks > 30 then
                 Sprint.gdState, st = nil, nil
-                sLog("state table stopped matching — hunting the live one again")
+                sLog("state table stopped matching — hunting a replacement")
             end
         end
+    elseif st then
+        local _, _, m = stateRead(st)
+        smod = m
     end
-    if not st then st = refreshState(ws) end
+    --// hunting is a full heap scan, so it runs on its own thread: doing it here
+    --// would stall the frame the moment we need the table most
+    if not st and not Sprint.hunting and (not Sprint.huntAt or now - Sprint.huntAt > 2) then
+        Sprint.huntAt, Sprint.hunting = now, true
+        task.spawn(function()
+            local found = refreshState(ws)
+            Sprint.hunting = false
+            if found then sLog("state table re-acquired") end
+        end)
+    end
 
     --// the resting WalkSpeed IS base_speed (10 on every reading). Wild jumps are
     --// ignored so a crouch or a launch cannot move the baseline we measure from.
@@ -672,10 +686,12 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     Sprint.learnNote = nil
     Sprint.lastBlock = nil
 
-    --// first write of a burst: remember what the game itself had in there
+    --// first write of a burst: remember what to hand back. This is 0 by
+    --// construction — at rest the game leaves int_speed at 0 (resting WalkSpeed
+    --// == base_speed on every reading) — and deriving it from WalkSpeed is more
+    --// reliable than reading it back off a table whose reads can lag.
     if not Sprint.lastWrite or now - Sprint.lastWrite > 0.4 then
-        local _, int0 = stateRead(st)
-        Sprint.RestInt = math.max(0, tonumber(int0) or 0)
+        Sprint.RestInt = 0
         sLog(("holding: int_speed %.2f -> WalkSpeed %.2f (this loadout's own top)")
             :format(Sprint.TopWS - Sprint.WalkBase, Sprint.TopWS))
     end
