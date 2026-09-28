@@ -579,6 +579,7 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
 
     local ws = hum.WalkSpeed
     local now = os.clock()
+    Sprint.holdNow = false --// set again below only while we are actually holding
 
     --// ---------------------------------------------------------------------
     --// LEARNING USES WalkSpeed, NEVER THIS TABLE. Reading int_speed back hands
@@ -671,11 +672,17 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     end
 
     if not canHold then
-        --// hand the game's own resting int back after a burst: it does not always
-        --// rewrite int_speed when its own sprint state never ran, and leaving our
-        --// value behind would read as a permanent speed boost
-        if st and Sprint.RestInt ~= nil and Sprint.lastWrite and (now - Sprint.lastWrite) < 0.5 then
-            pcall(rawset, st, "int_speed", Sprint.RestInt)
+        --// GUARANTEED CLEANUP. Anything we injected must not outlive the hold, and
+        --// it must be undone on the EXACT table we wrote to — losing the cached
+        --// reference mid-burst is what used to leave the player permanently fast.
+        if Sprint.injected and Sprint.injTable then
+            local restore = Sprint.RestInt or 0
+            local okR = pcall(rawset, Sprint.injTable, "int_speed", restore)
+            if okR then Sprint.injected = false end
+        end
+        --// keep handing it back for a moment too, in case the game rewrites it
+        if st and Sprint.lastWrite and (now - Sprint.lastWrite) < 0.5 then
+            pcall(rawset, st, "int_speed", Sprint.RestInt or 0)
         end
         if Sprint.learnNote ~= true and Sprint.ShiftDown and allowed and not Sprint.TopWS then
             Sprint.learnNote = true
@@ -715,9 +722,22 @@ conns[#conns + 1] = RunService.PreSimulation:Connect(function()
     end
     Sprint.Writes = Sprint.Writes + 1
     Sprint.lastWrite = now
+    Sprint.holdNow = true
+    Sprint.injTable, Sprint.injValue, Sprint.injected = st, target, true
     if Sprint.Writes == 1 or Sprint.Writes % 300 == 0 then
         sLog(("no-accel: int_speed %.2f -> WalkSpeed %.2f (your own top, no ramp)")
             :format(target, Sprint.TopWS))
+    end
+end)
+
+--// THE RACE, WON: the recorded trace showed WalkSpeed still ramping while we held
+--// a value, i.e. the game recomputes it from its own ramp after the PreSimulation
+--// pass. Re-asserting the same value on RenderStepped (the last phase of the frame)
+--// makes ours the value the next physics step consumes, so the ramp has nowhere
+--// left to happen.
+conns[#conns + 1] = RunService.RenderStepped:Connect(function()
+    if Sprint.holdNow and Sprint.injTable and Sprint.injValue then
+        pcall(rawset, Sprint.injTable, "int_speed", Sprint.injValue)
     end
 end)
 
