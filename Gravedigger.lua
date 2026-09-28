@@ -85,7 +85,28 @@
 --// fields zeroed. The game's own MainLoop consumes our values — we feed the
 --// machine instead of fighting it. The velocity launch is gone (obsolete —
 --// the game re-positions every frame); WalkSpeed pin stays for animations.
-
+--//
+--// v2.2: MAPPED, NOT GUESSED — the live state table was finally read correctly
+--// (pairs, not rawget: rawget returns a stale snapshot from that proxy table):
+--//     Humanoid.WalkSpeed = base_speed + int_speed
+--//   base_speed is flat (10), int_speed ramps up to the class's sprint target
+--//   over ~1-2s while Shift is held. Verified live: base 30 + int 30 produced a
+--//   real WalkSpeed of 60 and real movement at 64 st/s, and the jump happened
+--//   the instant the write landed — so int_speed IS the knob.
+--// Why the previous versions could never work, measured instead of guessed:
+--//   * v1.5-v2.0 wrote Humanoid.WalkSpeed. The game RECOMPUTES WalkSpeed from
+--//     its state table every frame, so our value never reached physics. Proven:
+--//     WalkSpeed sat at 24 while the character's own velocity stayed at 18.
+--//   * v2.1 wrote the right field on the wrong phase (Heartbeat, which the
+--//     game's own recompute overwrites) with a fabricated constant
+--//     (INT_MAX 6 + bonus 10 = 16) that happened to equal the natural end of the
+--//     ramp — so it did nothing except add a +10 st/s boost.
+--// v2.2 writes int_speed = (the game's OWN learned sprint top - base_speed) on
+--// RunService.PreSimulation, the last phase before the physics step, so the value
+--// is the one physics consumes. The top is learned passively from WalkSpeed
+--// whenever we are not overriding, so the player's speed is never altered — only
+--// the ~1-2s ramp is removed. The bonus slider is gone: no speed changes.
+--
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
 --//   loadstring(game:HttpGet("https://raw.githubusercontent.com/Chris5313/Hamas-Roblox/main/Gravedigger.lua?v=" .. tostring(os.time()), true))()
@@ -113,7 +134,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "2.1",
+        Version = "2.2",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -373,19 +394,21 @@ end
 getgenv().HamasGD_ESP = ESP
 
 --// ===========================================================================
---// v1.6 NO-ACCELERATION SPRINT (watchdog v2)
---//   * per-character WalkSpeed CHANGED hook — the game's ramp write is undone
---//     synchronously, no matter which loop runs first
---//   * Heartbeat backup enforcer for anything the hook can miss
+--// v2.2 NO-ACCELERATION SPRINT (mapped)
+--//   * speed model: Humanoid.WalkSpeed = base_speed + int_speed
+--//   * we write int_speed on PreSimulation so the PHYSICS STEP consumes it
+--//   * the value written is the game's own sprint top (learned from WalkSpeed),
+--//     so top speed is untouched — only the ramp is skipped
+--//   * sprint_block / sprint_force_stop / sprint_wall_stopper zeroed while held
+--//     so the game cannot kill a sprint mid-run
 --//   * real Shift key tracking (InputBegan/InputEnded, chat-aware)
 --//   * EVERYTHING logged: console + debug log + getgenv().HamasGD_Sprint.Log
 --// ===========================================================================
-local Sprint = { Enabled = false, Target = 16, Overrides = 0, ShiftDown = false,
-    peakWS = 0, peakSP = 0 }
---// keep the calibrated sprint speed across re-executes
+local Sprint = { Enabled = false, ShiftDown = false, Peak = nil, Writes = 0 }
+--// keep the learned sprint top across re-executes (same Roblox session)
 do
     local prev = getgenv().HamasGD_Sprint
-    if prev and prev.Learned then Sprint.Learned = prev.Learned end
+    if prev and prev.Peak then Sprint.Peak = prev.Peak end
 end
 getgenv().HamasGD_Sprint = Sprint
 
@@ -411,52 +434,33 @@ local function sprintAllowed()
     return true, hum
 end
 
-local function enforce(hum)
-    if hum.WalkSpeed < Sprint.Target then
-        local had = hum.WalkSpeed
-        hum.WalkSpeed = Sprint.Target
-        Sprint.Overrides = Sprint.Overrides + 1
-        if Sprint.Overrides <= 5 or Sprint.Overrides % 60 == 0 then
-            sLog("override #" .. Sprint.Overrides .. ": game wrote "
-                .. math.floor(had * 10) / 10 .. " -> pinned " .. Sprint.Target)
-        end
-    end
-end
-
---// per-character watchdog: fires the moment ANY code writes WalkSpeed
-local function watchCharacter(ch)
-    local hum = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 10)
-    if not hum then sLog("watch: no Humanoid on", ch.Name) return end
-    sLog("watching", ch.Name, "| WalkSpeed", hum.WalkSpeed)
-    conns[#conns + 1] = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-        if Sprint.ShiftDown and sprintAllowed() then
-            enforce(hum)
-        end
-    end)
-end
-
-conns[#conns + 1] = LocalPlayer.CharacterAdded:Connect(function(ch)
-    task.spawn(watchCharacter, ch)
-end)
-if LocalPlayer.Character then task.spawn(watchCharacter, LocalPlayer.Character) end
+--// v1.5-v2.1 removed from here: the per-character WalkSpeed watchdog and the
+--// Heartbeat enforcer. Both were proven useless live — the game recomputes
+--// WalkSpeed from its own state table every frame, so pinning WalkSpeed never
+--// reached the physics step (measured: WalkSpeed held at 24, real velocity 18).
 
 --// real Shift tracking (gameProcessed = typing in chat / UI has focus)
 conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
     if input.KeyCode == Enum.KeyCode.LeftShift then
         Sprint.ShiftDown = not gp
-        if Sprint.Enabled then sLog("Shift DOWN -> pinning WalkSpeed to", Sprint.Target) end
+        if Sprint.Enabled then
+            sLog("Shift DOWN", Sprint.Peak and ("-> straight to " .. Sprint.Peak .. " st/s")
+                or "-> learning your sprint top on this one")
+        end
     end
 end)
 conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
     if input.KeyCode == Enum.KeyCode.LeftShift then
         Sprint.ShiftDown = false
-        if Sprint.Enabled then sLog("Shift UP -> game resets speed itself") end
     end
 end)
 
---// STATE HIJACK (v2.1): find the game's per-player state table (single table in
---// the GC with sprint_ticker + sprinting_max_speed keys) and write its ramp and
---// force-stop fields directly while Shift is held.
+--// STATE TABLE (v2.2): the game's per-sprint state table — the single table in
+--// the GC holding sprint_ticker + sprinting_max_speed + int_speed. int_speed is
+--// the live speed contribution the game adds to base_speed, and it is the value
+--// we feed. NOTE: read this table with pairs(), not rawget() — rawget on this
+--// proxy returns a stale snapshot (it reported int_speed 9 while WalkSpeed was
+--// ramping 19.4 -> 26.5); writes through rawset DO reach the live state.
 local function findGDState()
     local found
     for _, f in ipairs(getgc(true)) do
@@ -471,9 +475,6 @@ local function findGDState()
                                 and v.int_speed ~= nil
                         end)
                         if okT then
-                            local probe = false
-                            pcall(function() probe = rawget(v, "sprint_ticker") ~= nil or rawget(v, "sprint_ticker") == nil end)
-                            -- prefer rawget hit; tables with metatables still expose keys via pairs on the proxy
                             local n = 0
                             pcall(function() for _ in pairs(v) do n = n + 1 end end)
                             if n > 40 then found = v; break end
@@ -497,33 +498,75 @@ local function refreshState()
 end
 refreshState()
 
---// natural ramp max: base_speed 10 + int_speed 6 = 16 (measured flat top).
-local INT_MAX = 6
+--// base_speed = the flat walking component of the game's speed model.
+--// WalkSpeed = base_speed + int_speed  =>  int_speed = wanted - base_speed.
+local function baseSpeed()
+    local st = Sprint.gdState
+    if not st then return nil end
+    local ok, b = pcall(rawget, st, "base_speed")
+    b = tonumber(b)
+    return (ok and b and b > 0) and b or nil
+end
 
-conns[#conns + 1] = RunService.Heartbeat:Connect(function()
-    if Sprint.ShiftDown then
-        local ok, humOrWhy = sprintAllowed()
-        if ok then
+--// THE FIX: RunService.PreSimulation fires immediately before the physics step,
+--// so whatever is written here is what the character actually moves with. Every
+--// version before this one wrote on Heartbeat/Stepped and lost that race.
+conns[#conns + 1] = RunService.PreSimulation:Connect(function()
+    local ch = LocalPlayer.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    local allowed, why = sprintAllowed()
+    if not allowed then
+        if why == "disabled" then
             Sprint.lastBlock = nil
-            enforce(humOrWhy) -- WalkSpeed pin keeps sprint animations correct
-            local st = Sprint.gdState or refreshState()
-            if st then
-                local okW, errW = pcall(function()
-                    rawset(st, "int_speed", INT_MAX + (Sprint.Bonus or 0)) -- ramp skipped: full bonus NOW
-                    rawset(st, "sprint_block", false)                      -- no forced sprint breaks
-                    rawset(st, "sprint_force_stop", 0)
-                    rawset(st, "sprint_wall_stopper", 0)
-                end)
-                if not okW and errW ~= Sprint.lastWriteErr then
-                    Sprint.lastWriteErr = errW
-                    sLog("state write failed:", tostring(errW))
-                    Sprint.gdState = nil -- stale table (respawned) — re-hunt next frame
+        elseif Sprint.ShiftDown and why ~= Sprint.lastBlock then
+            Sprint.lastBlock = why
+            sLog("Shift held but sprint BLOCKED:", why)
+        end
+    end
+
+    local st = Sprint.gdState
+    local base = baseSpeed()
+    if not (allowed and st and base and Sprint.Peak and Sprint.Peak > base) then
+        --// not overriding anything: whatever WalkSpeed the game settles on IS its
+        --// sprint top, so remember the highest we ever see. We write nothing on
+        --// this path, so we can never learn our own value.
+        if hum.Health > 0 then
+            local ws = hum.WalkSpeed
+            if ws > (Sprint.Peak or 0) + 0.01 then
+                Sprint.Peak = ws
+                if ws - (base or 10) > 1 then
+                    sLog(("sprint top learned: %.1f st/s — Shift now jumps straight there"):format(ws))
                 end
             end
-        elseif humOrWhy ~= Sprint.lastBlock then
-            Sprint.lastBlock = humOrWhy
-            sLog("Shift held but sprint BLOCKED:", humOrWhy)
         end
+        return
+    end
+
+    Sprint.lastBlock = nil
+    --// feed the game's own input instead of fighting its output: int_speed is
+    --// what the game adds to base_speed, so writing it makes the sprint land at
+    --// exactly the player's normal top speed, instantly.
+    local target = Sprint.Peak - base
+    local ok, err = pcall(function()
+        rawset(st, "int_speed", target)
+        rawset(st, "sprint_block", false)     --// no forced sprint breaks
+        rawset(st, "sprint_force_stop", 0)    --// no mid-run sprint kills
+        rawset(st, "sprint_wall_stopper", 0)
+    end)
+    if not ok then
+        Sprint.gdState = nil --// stale table (respawned) — re-hunt next frame
+        if err ~= Sprint.lastWriteErr then
+            Sprint.lastWriteErr = err
+            sLog("state write failed:", tostring(err))
+        end
+        return
+    end
+    Sprint.Writes = Sprint.Writes + 1
+    if Sprint.Writes == 1 or Sprint.Writes % 180 == 0 then
+        sLog(("no-accel: int_speed %.1f + base %.1f = %.1f st/s (your normal top, no ramp)")
+            :format(target, base, Sprint.Peak))
     end
 end)
 
@@ -576,24 +619,16 @@ end
 
 M:CreateSection("Movement")
 M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false,
-    Description = "Full sprint speed the instant you press Shift — skips the ~2s ramp (logs to console)",
+    Description = "Removes the sprint ramp only — your sprint speed is unchanged, it just arrives the instant you press Shift",
     Callback = function(v)
         Sprint.Enabled = v
         if v then
-            sLog("ENABLED — first sprint calibrates, then every sprint is instant",
-                Sprint.Learned and ("(calibrated: " .. Sprint.Learned .. " st/s)") or "(not calibrated yet)")
-            if not Sprint.ShiftDown then sLog("note: Shift not held yet — press LeftShift to sprint") end
-            local ch = LocalPlayer.Character
-            if ch and not ch:FindFirstChildOfClass("Humanoid") then
-                sLog("note: current character has NO Humanoid — respawn may be needed")
-            end
+            sLog("ENABLED —", Sprint.Peak and (("sprint top %.1f st/s, Shift jumps straight to it"):format(Sprint.Peak))
+                or "no sprint seen yet — the next sprint measures your top, then every press is instant")
         else
             sLog("DISABLED")
         end
     end })
-M:CreateSlider("GD_SprintSpeed", { Title = "Sprint bonus", Default = 0, Min = 0, Max = 10, Rounding = 0,
-    Description = "Extra sprint speed, applied through the game's own speed system (0 = exactly a full legit sprint, instantly).",
-    Callback = function(v) Sprint.Bonus = v end })
 
 M:CreateSection("Gravedigger")
 M:CreateButton({
@@ -635,7 +670,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v2.1 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v2.2 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v2.1 — sprint state hijack", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient",        Content = "Gravedigger v2.2 — sprint ramp removed", Duration = 3 })
 end)
