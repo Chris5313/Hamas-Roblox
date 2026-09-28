@@ -66,6 +66,15 @@
 --// the first sprint measures the real top speed (Learned), and every sprint
 --// after drives straight to it from the first press — no ramp. Bonus slider can
 --// push above the learned top (server has shown it tolerates >= 22).
+--//
+--// v2.0: RAMP KILLER (LAUNCH, DON'T CAP) — final diagnosis from live telemetry:
+--// the game's real sprint top VARIES 20-24 st/s (stance/class/perks) and its
+--// RenderStepped MainLoop re-asserts control after any physics write, so ANY
+--// fixed target ended up BRAKING the player below his own sprint. v2.0 never
+--// caps: on the Shift press it fires a 0.6s power-launch that accelerates the
+--// character hard along MoveDirection (replacing the 2s ramp with ~0.5s), then
+--// hands back to the game's own controller for top speed. Braking is now
+--// impossible by construction; top speed is always the game's own.
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -94,7 +103,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.9",
+        Version = "2.0",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -435,11 +444,15 @@ conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
---// backup enforcer + AUTO-CALIBRATED GROUND-SPEED CONTROLLER (v1.9):
---//   sprint 1 = calibration (measures the game's real top speed)
---//   sprint 2+ = driven straight to Learned (+ bonus) from the first press
-local lastPos, lastT, vSet = nil, nil, 0
+--// RAMP KILLER (v2.0): on Shift press, 0.6s power-launch along MoveDirection,
+--// then hand back to the game's own speed controller. NEVER caps or brakes.
+local vSet, boostT, wasDown = 0, 0, false
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+    if Sprint.ShiftDown and not wasDown then
+        boostT = 0
+        sLog("launch: ramp killed — full speed in ~0.5s")
+    end
+    wasDown = Sprint.ShiftDown
     if Sprint.ShiftDown then
         local ok, humOrWhy = sprintAllowed()
         if ok then
@@ -450,61 +463,30 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
             local hrp = ch and (ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart)
             if hrp and not hrp.Anchored then
                 local md = hum.MoveDirection
-                local now = os.clock()
-                if lastPos and lastT then
-                    local dt = now - lastT
-                    if dt > 0.02 then
-                        local d = hrp.Position - lastPos
-                        local flat = Vector3.new(d.X, 0, d.Z)
-                        if md.Magnitude > 0.05 then
-                            local spActual = flat.Magnitude / dt
-                            if flat.Magnitude > 0.05 and flat.Unit:Dot(md.Unit) < 0 then
-                                spActual = -spActual
-                            end
-                            if spActual > 0 then
-                                if not Sprint.Learned then
-                                    -- CALIBRATION: follow the game's own ramp and record its top
-                                    Sprint.learnT = (Sprint.learnT or 0) + dt
-                                    Sprint.learnMax = math.max(Sprint.learnMax or 0, spActual)
-                                    if Sprint.learnT > 3
-                                        or (Sprint.learnT > 1.2
-                                            and (Sprint.learnMax - spActual) < 0.4) then
-                                        Sprint.Learned = math.max(16, math.floor(Sprint.learnMax + 0.5))
-                                        sLog("calibrated: your real sprint top is", Sprint.Learned,
-                                            "st/s — sprints are instant from now on")
-                                        Sprint.learnT, Sprint.learnMax = nil, nil
-                                    end
-                                else
-                                    -- DRIVE: straight to learned top (+ bonus), every press
-                                    local tgt = Sprint.Learned + (Sprint.Bonus or 0)
-                                    local err = tgt - spActual
-                                    vSet = math.clamp(vSet + err * dt * 8, 0, 30)
-                                    local v = hrp.AssemblyLinearVelocity
-                                    hrp.AssemblyLinearVelocity = Vector3.new(md.Unit.X * vSet, v.Y, md.Unit.Z * vSet)
-                                    if spActual > Sprint.peakSP then Sprint.peakSP = math.floor(spActual * 10) / 10 end
-                                end
-                            end
-                        else
-                            vSet = 0
-                        end
+                if md.Magnitude > 0.05 then
+                    local dtU = Sprint._dt or 0.016
+                    if boostT < 0.6 then
+                        boostT = boostT + dtU
+                        vSet = math.min(vSet + 55 * dtU, (Sprint.Learned or 22) + (Sprint.Bonus or 0) + 3)
+                        local v = hrp.AssemblyLinearVelocity
+                        hrp.AssemblyLinearVelocity = Vector3.new(md.Unit.X * vSet, v.Y, md.Unit.Z * vSet)
+                    else
+                        vSet = 0 -- handoff: the game owns top speed again
                     end
+                else
+                    vSet = 0
                 end
-                lastPos, lastT = hrp.Position, now
-                if hum.WalkSpeed > Sprint.peakWS then Sprint.peakWS = math.floor(hum.WalkSpeed * 10) / 10 end
             end
         elseif humOrWhy ~= Sprint.lastBlock then
             Sprint.lastBlock = humOrWhy
             sLog("Shift held but sprint BLOCKED:", humOrWhy)
         end
     else
-        lastPos, lastT, vSet = nil, nil, 0
-        Sprint.learnT, Sprint.learnMax = nil, nil
-        if Sprint.peakSP > 0 then
-            sLog("sprint ended — peak WS", Sprint.peakWS, "| ACTUAL ground speed", Sprint.peakSP)
-            Sprint.peakWS, Sprint.peakSP = 0, 0
-        end
+        vSet, boostT = 0, 0
     end
 end)
+-- track real dt for the integrator
+conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt) Sprint._dt = dt end)
 
 local M = Tabs.Main
 M:CreateSection("Gravedigger")
@@ -564,8 +546,8 @@ M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false
             sLog("DISABLED")
         end
     end })
-M:CreateSlider("GD_SprintSpeed", { Title = "Extra speed above your sprint", Default = 0, Min = 0, Max = 10, Rounding = 0,
-    Description = "0 = instant full sprint at your game's real top speed. Higher = faster than normal (more visible).",
+M:CreateSlider("GD_SprintSpeed", { Title = "Launch strength", Default = 0, Min = 0, Max = 10, Rounding = 0,
+    Description = "Extra speed during the 0.6s launch only. Top speed is always your game's own — this never caps you.",
     Callback = function(v) Sprint.Bonus = v end })
 
 M:CreateSection("Gravedigger")
@@ -608,7 +590,7 @@ getgenv().HamasGD_Shutdown = function()
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.9 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v2.0 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.9 — calibrated instant sprint", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v2.0 — sprint ramp killer", Duration = 3 })
 end)
