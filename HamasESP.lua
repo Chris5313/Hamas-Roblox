@@ -18,6 +18,7 @@ local ESP = {
     Tracked = {},          -- [instance] = rec
     Pool = {},             -- ["Square"/"Text"/"Line"] = { obj, ... }
     Enabled = false,
+    IsAlive = nil,         --// v1.4: optional game-side fn (inst) -> bool; false drops the box NOW
     Stats = { tracked = 0, drawn = 0 },
     Cfg = {
         Boxes = false, Names = false, Distance = false, Health = false, Tracers = false,
@@ -175,6 +176,17 @@ local function updateOne(entity, rec)
         for _, d in ipairs(rec.draws) do d.Visible = false end
         return
     end
+    --// v1.4: aliveness re-check (game scripts set ESP.IsAlive). Games like
+    --// Grave/Digger keep the model in workspace as a ragdoll after death, so
+    --// without this the box would sit on the corpse. Returning false makes the
+    --// render loop drop the track the same frame.
+    if ESP.IsAlive then
+        local okA, aliveA = pcall(ESP.IsAlive, entity)
+        if okA and aliveA == false then
+            for _, d in ipairs(rec.draws) do d.Visible = false end
+            return false
+        end
+    end
     local camPos = cam.CFrame.Position
 
     local cf = livePivot(entity)
@@ -271,6 +283,10 @@ local function rescan()
     -- 1) drop tracks that are dead, disabled, or out of range
     for entity, rec in pairs(ESP.Tracked) do
         local keep = ESP.Enabled and rec.def.Enabled and entity.Parent
+        if keep and ESP.IsAlive then
+            local okA, aliveA = pcall(ESP.IsAlive, entity)
+            keep = okA and aliveA ~= false
+        end
         if keep then
             local cf = livePivot(entity)
             keep = cf and (cf.Position - camPos).Magnitude <= maxDist
@@ -368,7 +384,10 @@ local function rescan()
                                 ESP.Tracked[inst] = { def = def, data = cacheEntity(inst),
                                     draws = draws, kinds = kinds, classes = classes }
                             else
-                                rec.data = cacheEntity(inst)
+                                --// v1.4: re-cache size/humanoid refs every 4th rescan
+                                --// instead of every one (GetBoundingBox is not free)
+                                rec.age = (rec.age or 0) + 1
+                                if rec.age % 4 == 0 then rec.data = cacheEntity(inst) end
                             end
                         else
                             local draws, kinds, classes = buildDraws(def)
@@ -519,13 +538,15 @@ function ESP:Init(cfg)
                 --// v1.1: a frame update can never spam executor error dialogs
                 --// again — the first 5 failures print to the console with the
                 --// real message, the rest are silent until a rescan fixes them
-                local okU, errU = pcall(updateOne, entity, rec)
+                local okU, rU = pcall(updateOne, entity, rec)
                 if not okU then
                     updateErrors = updateErrors + 1
                     if updateErrors <= 5 then
-                        warn("[ESP] update error on '" .. tostring(entity.Name) .. "': " .. tostring(errU))
+                        warn("[ESP] update error on '" .. tostring(entity.Name) .. "': " .. tostring(rU))
                     end
                     hideOne(rec)
+                elseif rU == false then
+                    dropDraws(entity)   --// v1.4: died — box gone this frame, pool freed at rescan
                 else
                     drawn = drawn + 1
                 end

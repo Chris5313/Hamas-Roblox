@@ -1,24 +1,23 @@
 --// HamasClient — Gravedigger
---// ESP FIRST. The game uses CUSTOM player models ("from the stems") — characters
---// spawned/animated by the game itself, not the default Players rig — so a plain
---// Players:GetPlayers() pass shows nothing useful. Both categories here are
---// Collect()-driven and sort by EVIDENCE:
---//     * Team    = real players on your team + custom models carrying YOUR team key
---//     * Enemies = everything else alive that is not you
---// A team key is read from, in order: attribute "Team"/"TeamName" on the model,
---// a name match against a real player (then that player's Team), nothing.
---// getgenv().HamasGD_Probe() dumps every candidate model + how it classified, so
---// the filters can be tightened to the game's REAL team field on the next pass.
+--// ESP FIRST. Live fighters are CUSTOM game-owned models, not default rigs, so a
+--// plain Players:GetPlayers() pass shows nothing useful.
 --//
 --// v1.0: initial build — UI scaffold, Enemies/Team ESP, model probe.
 --// v1.2: LOAD FIX — `m:GetAttribute` (method access without a call) is a syntax
 --// error in Luau too, so loadstring returned nil and the executor printed
 --// "attempt to call a nil value" on the loader line. Plain GetAttribute calls now.
 --// v1.3: PROP FILTER — v1.2 boxed every anchored prop (graves/fences/crates) as
---// "enemy" because a missing team key counted as hostile. A model is only a live
---// entity now if it has a Humanoid, or is unanchored AND moving (static unanchored
---// junk drops after 8s). Probe now dumps EVERY raw model with keep/skip + reason
---// and the workspace layout, so the real spawn container/team field is obvious.
+--// "enemy" because a missing team key counted as hostile.
+--// v1.4: LIVE MAPPING + CLEAN DEATH — probed the live client through the executor
+--// bridge. Real layout: live fighters are player-named models under
+--// workspace.empire_team / workspace.nation_team (one folder per faction), and
+--// when someone dies their model does NOT disappear — a <name>_ragdoll copy is
+--// filed under workspace.bodies (stale copies also sit in workspace.notarget).
+--// So: enemies = enemy-faction players with living Humanoids + fighter models in
+--// the OTHER faction folder only; ragdolls/corpse containers are never tracked.
+--// ESP.IsAlive (engine v1.4) re-checks every tracked box per frame — the moment
+--// a model dies (Humanoid 0), is renamed *_ragdoll or filed under bodies/
+--// notarget, its box vanishes that frame. No more boxes on the dead.
 
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -42,12 +41,12 @@ end
 --// kill any previous run's loops/watchers before reloading
 if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 
---// v1.1: init failures print their exact cause to the console instead of
---// leaving you with a bare executor error box
+--// init failures print their exact cause to the console instead of leaving you
+--// with a bare executor error box
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "1.3",
+        Version = "1.4",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -62,14 +61,19 @@ end
 local Fluent, Window, Tabs, Debug, SaveManager = ctx.Fluent, ctx.Window, ctx.Tabs, ctx.Debug, ctx.SaveManager
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 local ESP = getgenv().HamasLoad("HamasESP.lua")
 local conns = {}
 
 --// ===========================================================================
---// WHO IS ON WHICH SIDE — evidence-based sorting for custom models
+--// LIVE-VERIFIED LAYOUT (probed in-client, Grave/Digger place 18259975825)
+--//   workspace.empire_team  — live fighter models, "Golden Empire" faction
+--//   workspace.nation_team  — live fighter models, "Royal Nation" faction
+--//   workspace.bodies       — <name>_ragdoll corpses (kept in workspace after death)
+--//   workspace.notarget     — stale copies of dead players' models
+--// Live fighters carry a Humanoid; corpses carry one at 0 HP. pl.Character can
+--// be the fighter model itself or nil depending on spawn state.
 --// ===========================================================================
 
 --// the part the box is drawn around
@@ -79,43 +83,20 @@ local function modelRoot(m)
         or m:FindFirstChildWhichIsA("BasePart")
 end
 
---// alive = a humanoid that is not dead, OR no humanoid at all (custom models are
---// often driven without one). A model with NO parts at all is never tracked.
+--// dead = has a Humanoid at 0 HP. The ragdoll copy of a dead player keeps its
+--// Humanoid (at 0), so this catches corpses even outside the body folders.
+local function isDead(m)
+    local hum = m:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health <= 0
+end
+
 local function isAlive(m)
     if not m:IsA("Model") then return false end
     if not m:FindFirstChildWhichIsA("BasePart") then return false end
-    local hum = m:FindFirstChildOfClass("Humanoid")
-    if hum and hum.Health <= 0 then return false end
-    return true
+    return not isDead(m)
 end
 
---// v1.3 prop filter: map props are anchored and humanoid-less; live models either
---// have a Humanoid or MOVE. An unanchored, humanoid-less model that has not moved
---// for PROP_STATIC_TIME stops being tracked.
-local PROP_STATIC_TIME = 8
-local seenModels = {}
-local function isEntity(m)
-    if m:FindFirstChildOfClass("Humanoid") then return true end
-    local root = modelRoot(m)
-    if not root or root.Anchored then return false end
-    local now = os.clock()
-    local rec = seenModels[m]
-    if not rec then
-        seenModels[m] = { pos = root.Position, still = 0, t = now }
-        return true
-    end
-    if (root.Position - rec.pos).Magnitude < 0.3 then
-        rec.still = rec.still + (now - rec.t)
-    else
-        rec.still = 0
-        rec.pos = root.Position
-    end
-    rec.t = now
-    return rec.still < PROP_STATIC_TIME
-end
-
---// read a team id off a custom model, or nil when it carries none. The probe
---// dump tells us which of these the game actually uses; all of them are cheap.
+--// read a team id off a model: attribute, else a live-player name match
 local function teamKeyOf(m)
     local attr = m:GetAttribute("Team")
     if attr ~= nil then return "attr:" .. tostring(attr) end
@@ -130,118 +111,173 @@ local function teamKeyOf(m)
     return nil
 end
 
-local function myTeamKey()
+local function myTeamName()
     local t = LocalPlayer.Team
-    return t and ("player:" .. tostring(t)) or nil
+    return t and t.Name or nil
 end
 
---// candidates: raw scan = top-level workspace models + two levels inside folders
---// (covers Units/WaveN/Enemy containers); candidateModels() applies the entity
---// filters on top of that.
-local function rawCandidates()
-    local out = {}
-    local function add(m)
-        if m:IsA("Model") then out[#out + 1] = m end
+--// faction folder -> team name (verified live; if the game renames them the
+--// probe dump shows it immediately)
+local TEAM_FOLDERS = {
+    empire_team = "Golden Empire",
+    nation_team = "Royal Nation",
+}
+
+local function folderTeamOf(m)
+    local p = m.Parent
+    return p and TEAM_FOLDERS[p.Name] or nil
+end
+
+local function isMySide(m)
+    local ft = folderTeamOf(m)
+    if ft then return ft == myTeamName() end
+    local mine = myTeamName()
+    if not mine then return false end
+    return teamKeyOf(m) == ("player:" .. mine)
+end
+
+--// fighter-name match that ignores whitespace and never matches ragdolls:
+--// "tortaxoo" == "tortaxoo " (spawn-styled names) but "<name>_ragdoll" fails.
+local function sameFighter(a, b)
+    if a == b then return true end
+    local s1 = a:gsub("%s+", "")
+    local s2 = b:gsub("%s+", "")
+    return s1 ~= "" and s1 == s2
+end
+
+--// a workspace model counts as a live ENEMY only with real fighter evidence:
+--// positive-Health Humanoid AND a live-player name match (whitespace ignored),
+--// AND not a ragdoll / not inside a corpse container.
+local function isEnemyModel(m)
+    if typeof(m) ~= "Instance" or not m:IsA("Model") or m == LocalPlayer.Character then
+        return false
     end
-    for _, m in ipairs(workspace:GetChildren()) do add(m) end
+    local p = m.Parent
+    local pname = p and p.Name or ""
+    if pname == "bodies" or pname == "notarget" then return false end
+    if m.Name:find("_ragdoll", 1, true) then return false end
+    local hum = m:FindFirstChildOfClass("Humanoid")
+    if not (hum and hum.Health > 0) then return false end
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= LocalPlayer and sameFighter(m.Name, pl.Name) then
+            return not isMySide(m)
+        end
+    end
+    return false
+end
+
+--// verified enemy fighter models: top-level workspace + one level in folders
+--// (isEnemyModel already rejects bodies/notarget by parent name)
+local function candidateModels()
+    local out = {}
+    for _, m in ipairs(workspace:GetChildren()) do
+        if isEnemyModel(m) then out[#out + 1] = m end
+    end
     for _, f in ipairs(workspace:GetChildren()) do
         if f:IsA("Folder") then
-            for _, m in ipairs(f:GetChildren()) do add(m) end
-            for _, g in ipairs(f:GetChildren()) do
-                if g:IsA("Folder") then
-                    for _, m in ipairs(g:GetChildren()) do add(m) end
-                end
+            for _, m in ipairs(f:GetChildren()) do
+                if isEnemyModel(m) then out[#out + 1] = m end
             end
         end
     end
     return out
 end
 
-local function candidateModels()
-    local out = {}
-    for _, m in ipairs(rawCandidates()) do
-        if m ~= LocalPlayer.Character and isAlive(m) and modelRoot(m) and isEntity(m) then
-            out[#out + 1] = m
+--// live enemies: enemy-faction players (alive only) + verified fighter models,
+--// deduped (an enemy's Character and his nation_team model are the same thing)
+local function myEnemies(camPos, maxDist)
+    local out, seen = {}, {}
+    local mine = myTeamName()
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= LocalPlayer and mine and pl.Team and pl.Team.Name ~= mine then
+            local ch = pl.Character
+            if ch and isAlive(ch) and not seen[ch] then
+                local hrp = modelRoot(ch)
+                if hrp then
+                    local d = (hrp.Position - camPos).Magnitude
+                    if d <= maxDist then
+                        seen[ch] = true
+                        out[#out + 1] = { inst = ch, d = d }
+                    end
+                end
+            end
         end
     end
+    for _, m in ipairs(candidateModels()) do
+        if not seen[m] then
+            local hrp = modelRoot(m)
+            if hrp then
+                local d = (hrp.Position - camPos).Magnitude
+                if d <= maxDist then
+                    seen[m] = true
+                    out[#out + 1] = { inst = m, d = d }
+                end
+            end
+        end
+    end
+    if #out > 1 then table.sort(out, function(a, b) return a.d < b.d end) end
     return out
 end
 
 --// ---------------------------------------------------------------------------
---// TEAM (blue): players on my team + custom models carrying my team key
+--// TEAM (blue): players on my team + fighter models in MY faction folder
 --// ---------------------------------------------------------------------------
 ESP:AddCategory({
     Name = "Team",
     Color = Color3.fromRGB(80, 200, 255),
     Max = 60,
     Collect = function(camPos, maxDist)
-        local mine = myTeamKey()
-        local out = {}
-        for _, pl in ipairs(Players:GetPlayers()) do
-            if pl ~= LocalPlayer and mine and pl.Team and tostring(pl.Team) == tostring(LocalPlayer.Team) then
-                local ch = pl.Character
-                if ch and isAlive(ch) then
-                    local hrp = modelRoot(ch)
-                    if hrp then
-                        local d = (hrp.Position - camPos).Magnitude
-                        if d <= maxDist then out[#out + 1] = { inst = ch, d = d } end
+        local out, seen = {}, {}
+        local mine = myTeamName()
+        if mine then
+            for _, pl in ipairs(Players:GetPlayers()) do
+                if pl ~= LocalPlayer and pl.Team == LocalPlayer.Team then
+                    local ch = pl.Character
+                    if ch and isAlive(ch) and not seen[ch] then
+                        local hrp = modelRoot(ch)
+                        if hrp then
+                            local d = (hrp.Position - camPos).Magnitude
+                            if d <= maxDist then
+                                seen[ch] = true
+                                out[#out + 1] = { inst = ch, d = d }
+                            end
+                        end
                     end
                 end
             end
-        end
-        if mine then
-            for _, m in ipairs(candidateModels()) do
-                if teamKeyOf(m) == mine then
-                    local hrp = modelRoot(m)
-                    local d = (hrp.Position - camPos).Magnitude
-                    if d <= maxDist then out[#out + 1] = { inst = m, d = d } end
+            for _, f in ipairs(workspace:GetChildren()) do
+                if f:IsA("Folder") and TEAM_FOLDERS[f.Name] == mine then
+                    for _, m in ipairs(f:GetChildren()) do
+                        if m ~= LocalPlayer.Character and not seen[m] and isAlive(m) then
+                            local hrp = modelRoot(m)
+                            if hrp then
+                                local d = (hrp.Position - camPos).Magnitude
+                                if d <= maxDist then
+                                    seen[m] = true
+                                    out[#out + 1] = { inst = m, d = d }
+                                end
+                            end
+                        end
+                    end
                 end
             end
         end
         if #out > 1 then table.sort(out, function(a, b) return a.d < b.d end) end
         return out
     end,
-    Filter = function(inst) return inst:IsA("Model") end,
 })
 
 --// ---------------------------------------------------------------------------
---// ENEMIES (red): players not on my team + customs that are NOT my team
---// (no team field at all counts as enemy — this is a hostile game)
+--// ENEMIES (red): enemy-faction players + verified enemy fighter models.
+--// Ragdolls, corpse containers and props can never pass isEnemyModel.
 --// ---------------------------------------------------------------------------
 ESP:AddCategory({
     Name = "Enemies",
     Color = Color3.fromRGB(255, 70, 70),
     Max = 80,
     Collect = function(camPos, maxDist)
-        local mine = myTeamKey()
-        local out = {}
-        for _, pl in ipairs(Players:GetPlayers()) do
-            if pl ~= LocalPlayer then
-                local sameTeam = mine and pl.Team and tostring(pl.Team) == tostring(LocalPlayer.Team)
-                if not sameTeam then
-                    local ch = pl.Character
-                    if ch and isAlive(ch) then
-                        local hrp = modelRoot(ch)
-                        if hrp then
-                            local d = (hrp.Position - camPos).Magnitude
-                            if d <= maxDist then out[#out + 1] = { inst = ch, d = d } end
-                        end
-                    end
-                end
-            end
-        end
-        for _, m in ipairs(candidateModels()) do
-            local k = teamKeyOf(m)
-            if k ~= mine then
-                local hrp = modelRoot(m)
-                local d = (hrp.Position - camPos).Magnitude
-                if d <= maxDist then out[#out + 1] = { inst = m, d = d } end
-            end
-        end
-        if #out > 1 then table.sort(out, function(a, b) return a.d < b.d end) end
-        return out
+        return myEnemies(camPos, maxDist)
     end,
-    Filter = function(inst) return inst:IsA("Model") end,
 })
 
 do
@@ -251,67 +287,29 @@ do
     print("[Hamas] Gravedigger: ESP init", okE and "ok" or ("FAILED: " .. tostring(errE)))
 end
 
---// ===========================================================================
---// Main tab — one button: dump every candidate model and how it classified.
---// This is how the enemy/team sorting gets tightened to the game's REAL team
---// field instead of guessed. Output goes to the console AND the debug log.
---// ===========================================================================
-local M = Tabs.Main
-M:CreateSection("Gravedigger")
-M:CreateButton({
-    Title = "Model probe (console + log)",
-    Description = "Dumps players, custom models, their team fields and the side each one sorts to",
-    Callback = function()
-        local lines = {}
-        local function say(...)
-            local parts = {}
-            for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
-            local line = table.concat(parts, " ")
-            lines[#lines + 1] = line
-            print("[GD-Probe] " .. line)
-            if Debug then Debug:Log("[Probe]", line) end
-        end
-        say("LocalPlayer:", LocalPlayer.Name, "| Team:", LocalPlayer.Team and LocalPlayer.Team.Name or "none")
-        for _, pl in ipairs(Players:GetPlayers()) do
-            say("player", pl.Name, "| team:", pl.Team and pl.Team.Name or "none",
-                "| char:", pl.Character and pl.Character.Name or "-")
-        end
-        for i, c in ipairs(workspace:GetChildren()) do
-            if i <= 40 then
-                say(("ws: %s (%s) children=%d"):format(c.Name, c.ClassName, #c:GetChildren()))
-            end
-        end
-        for _, m in ipairs(rawCandidates()) do
-            if m == LocalPlayer.Character then
-                say("skip", m.Name, "(you)")
-            elseif not isAlive(m) then
-                say("skip", m.Name, "(no parts / dead)")
-            elseif not isEntity(m) then
-                say("skip", m.Name, "(prop: anchored or static)")
-            else
-                local k = teamKeyOf(m)
-                say(("keep %s | parent=%s | hum=%s | anchored=%s | teamKey=%s | sorted=%s"):format(
-                    m.Name, m.Parent and m.Parent.Name or "?",
-                    m:FindFirstChildOfClass("Humanoid") and "y" or "n",
-                    tostring(modelRoot(m) and modelRoot(m).Anchored),
-                    tostring(k),
-                    k == myTeamKey() and "TEAM" or "ENEMY"))
-            end
-        end
-        say("done —", #lines, "lines")
-    end,
-})
+--// v1.4: instant death cleanup. The engine calls this on EVERY tracked box every
+--// frame; false drops the track immediately (box gone, drawing recycled). Death
+--// in this game keeps the model in workspace as a ragdoll, so without this the
+--// box would sit on the corpse for the whole rescan interval.
+ESP.IsAlive = function(inst)
+    if typeof(inst) ~= "Instance" or not inst.Parent then return false end
+    local pname = inst.Parent.Name
+    if pname == "bodies" or pname == "notarget" then return false end
+    if inst.Name:find("_ragdoll", 1, true) then return false end
+    if isDead(inst) then return false end
+    return true
+end
 
---// getgenv().HamasGD_Probe() — same dump from the console
-getgenv().HamasGD_Probe = function()
-    local n = 0
-    local function say(...)
-        local parts = {}
-        for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
-        print("[GD-Probe] " .. table.concat(parts, " "))
-        n = n + 1
-    end
-    say("LocalPlayer:", LocalPlayer.Name, "| Team:", LocalPlayer.Team and LocalPlayer.Team.Name or "none")
+--// debug handle for remote inspection through the executor bridge
+getgenv().HamasGD_ESP = ESP
+
+--// ===========================================================================
+--// Probe — dumps every top-level model with keep/skip + reason, plus players
+--// and the workspace layout. Console AND debug log. Used to re-verify the
+--// faction folders if the game updates its spawn layout.
+--// ===========================================================================
+local function probeDump(say)
+    say("LocalPlayer:", LocalPlayer.Name, "| Team:", myTeamName() or "none")
     for _, pl in ipairs(Players:GetPlayers()) do
         say("player", pl.Name, "| team:", pl.Team and pl.Team.Name or "none",
             "| char:", pl.Character and pl.Character.Name or "-")
@@ -321,24 +319,63 @@ getgenv().HamasGD_Probe = function()
             say(("ws: %s (%s) children=%d"):format(c.Name, c.ClassName, #c:GetChildren()))
         end
     end
-    for _, m in ipairs(rawCandidates()) do
-        if m == LocalPlayer.Character then
-            say("skip", m.Name, "(you)")
-        elseif not isAlive(m) then
-            say("skip", m.Name, "(no parts / dead)")
-        elseif not isEntity(m) then
-            say("skip", m.Name, "(prop: anchored or static)")
-        else
-            local k = teamKeyOf(m)
-            say(("keep %s | parent=%s | hum=%s | anchored=%s | teamKey=%s | sorted=%s"):format(
-                m.Name, m.Parent and m.Parent.Name or "?",
-                m:FindFirstChildOfClass("Humanoid") and "y" or "n",
-                tostring(modelRoot(m) and modelRoot(m).Anchored),
-                tostring(k),
-                k == myTeamKey() and "TEAM" or "ENEMY"))
+    for _, m in ipairs(workspace:GetChildren()) do
+        if m:IsA("Model") then
+            local p = m.Parent and m.Parent.Name or "?"
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            local why
+            if m == LocalPlayer.Character then
+                why = "you"
+            elseif p == "bodies" or p == "notarget" then
+                why = "corpse container"
+            elseif m.Name:find("_ragdoll", 1, true) then
+                why = "ragdoll corpse"
+            elseif isDead(m) then
+                why = "dead humanoid"
+            elseif isEnemyModel(m) then
+                why = "ENEMY fighter"
+            elseif TEAM_FOLDERS[p] then
+                why = "team fighter (" .. TEAM_FOLDERS[p] .. ")"
+            else
+                why = "ignored (no fighter evidence)"
+            end
+            say(("model %s | parent=%s | hum=%s | hp=%s | teamKey=%s | %s"):format(
+                m.Name, p, hum and "y" or "n",
+                hum and tostring(math.floor(hum.Health)) or "-",
+                tostring(teamKeyOf(m)), why))
         end
     end
-    say("done —", n, "lines")
+end
+
+local M = Tabs.Main
+M:CreateSection("Gravedigger")
+M:CreateButton({
+    Title = "Model probe (console + log)",
+    Description = "Dumps players, workspace layout and every model with keep/skip + reason",
+    Callback = function()
+        local n = 0
+        probeDump(function(...)
+            local parts = {}
+            for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+            local line = table.concat(parts, " ")
+            n = n + 1
+            print("[GD-Probe] " .. line)
+            if Debug then Debug:Log("[Probe]", line) end
+        end)
+        print("[GD-Probe] done —", n, "lines")
+    end,
+})
+
+--// getgenv().HamasGD_Probe() — same dump from the console
+getgenv().HamasGD_Probe = function()
+    local n = 0
+    probeDump(function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+        print("[GD-Probe] " .. table.concat(parts, " "))
+        n = n + 1
+    end)
+    print("[GD-Probe] done —", n, "lines")
     return n
 end
 
@@ -348,11 +385,10 @@ end
 getgenv().HamasGD_Shutdown = function()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     conns = {}
-    for k in pairs(seenModels) do seenModels[k] = nil end
     pcall(function() ESP:Shutdown() end)
 end
 
-print("[Hamas] Gravedigger v1.3 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v1.4 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.3 loaded — ESP first", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient", Content = "Gravedigger v1.4 loaded — ESP first", Duration = 3 })
 end)
