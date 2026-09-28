@@ -740,6 +740,9 @@ local function removeSilentHook()
     Combat.Hook = nil
 end
 
+--// exposed for the UI and for console testing: getgenv().HamasGD_Combat.install()
+Combat.install, Combat.remove, Combat.pickTarget = installSilentHook, removeSilentHook, pickTarget
+
 --// ---------------------------------------------------------------------------
 --// per-frame: resolve the target, drive the camera (aimbot only), feed silent aim
 --// ---------------------------------------------------------------------------
