@@ -19,93 +19,13 @@
 --// a model dies (Humanoid 0), is renamed *_ragdoll or filed under bodies/
 --// notarget, its box vanishes that frame. No more boxes on the dead.
 --//
---// v1.5: NO-ACCELERATION SPRINT — measured the live sprint system by driving real
---// W/Shift input through VirtualInputManager and sampling WalkSpeed at 10 Hz:
---//   walk = 10, sprint ramps 10 -> 16 over ~2s, release snaps back instantly.
---// That ramp IS the annoying "acceleration". The whole system is a client loop
---// writing hum.WalkSpeed (no stamina attributes, no custom physics, speed ==
---// WalkSpeed in every sample), and the server only sees your position — so
---// pinning WalkSpeed to 16 while Shift is held is byte-identical on the wire to
---// a legit fully-ramped sprinter. Heartbeat loop pins it while Shift is down;
---// on release the game's own instant reset to 10 runs untouched. Nothing is
---// written while you're typing in chat.
+--// v1.5-v2.4 NO-ACCELERATION SPRINT — DELETED at your request. It did eventually
+--// work (the game computes Humanoid.WalkSpeed = base_speed + int_speed, and the
+--// ramp is int_speed), but the game re-asserts its own ramp mid-sprint, so the
+--// hold kept trading wins with it and could leave a stale speed behind. Feature,
+--// state-table probing and its UI are all gone; the findings live in git history.
 --//
---// v1.6: SPRINT WATCHDOG v2 — v1.5 pinned WalkSpeed on Heartbeat and LOST the
---// race: the game's ramp loop writes WalkSpeed in the same frame (likely after
---// us), so the pin was invisible. v1.6 stops racing and wins by construction:
---// a per-character WalkSpeed CHANGED hook stamps the speed back to target the
---// instant the game's loop writes it (signal handlers run synchronously after
---// their write), plus a Heartbeat backup enforcer. Every state change and every
---// win/loss against the game is logged to console, the debug log, and a rolling
---// buffer at getgenv().HamasGD_Sprint.Log.
---//
---// v1.7: DIRECT DRIVE — instrumented runs proved WalkSpeed pinning alone fights
---// the game's own velocity controller (WalkSpeed steady 16 while actual velocity
---// bounced 11-29 st/s = two systems wrestling). v1.7 becomes the propulsion:
---// while Shift is held we drive HumanoidRootPart.AssemblyLinearVelocity straight
---// at the target speed along MoveDirection every Heartbeat (the AOT-proven
---// pattern). WalkSpeed stays pinned so sprint animations trigger. No ramp can
---// survive that — the character physically moves at target speed the frame you
---// press. Peak speeds are recorded per sprint (Sprint.peakWS / Sprint.peakSP)
---// so a later check shows exactly what your run did.
---//
---// v1.8: GROUND-SPEED CONTROLLER — post-rejoin probe proved Character IS the
---// faction model (Workspace.nation_team.sebawar) and the game's ramp loop owns
---// its Humanoid (61 WS writes / 6s) but moves the body with its own integrator
---// (WalkSpeed is cosmetic — pinning it changed nothing, velocity-drive fought
---// it). v1.8 measures REAL displacement per tick (position delta — catches
---// CFrame stepping too) and integrates our velocity contribution until actual
---// ground speed equals the target, whatever the game's integrator adds. Total
---// speed converges to target in ~0.3s; collisions still respected (velocity
---// based, no wall clipping).
---//
---// v1.9: AUTO-CALIBRATED SPRINT — the v1.8 logs exposed the real bug: actual
---// ground speed during sprint measured ~22 st/s, i.e. the game's true sprint top
---// speed is ~22 and WalkSpeed (10->16) was ALWAYS cosmetic. Targeting 16 meant
---// the controller BRAKED the player below his normal sprint. v1.9 calibrates:
---// the first sprint measures the real top speed (Learned), and every sprint
---// after drives straight to it from the first press — no ramp. Bonus slider can
---// push above the learned top (server has shown it tolerates >= 22).
---//
---// v2.0: RAMP KILLER (LAUNCH, DON'T CAP) — final diagnosis from live telemetry:
---// the game's real sprint top VARIES 20-24 st/s (stance/class/perks) and its
---// RenderStepped MainLoop re-asserts control after any physics write, so ANY
---// fixed target ended up BRAKING the player below his own sprint. v2.0 never
---// caps: on the Shift press it fires a 0.6s power-launch that accelerates the
---// character hard along MoveDirection (replacing the 2s ramp with ~0.5s), then
---// hands back to the game's own controller for top speed. Braking is now
---// impossible by construction; top speed is always the game's own.
---//
---// v2.1: STATE HIJACK — found the game's per-player state table via getgc
---// upvalue hunting: ONE table in the heap with sprint_ticker (a tick() stamp),
---// int_speed (THE ramp: base_speed 10 + int_speed 0->6 over ~2s), sprint_block,
---// sprint_force_stop and sprint_wall_stopper (timestamp force-stops = the
---// annoying mid-run sprint kills). v2.1 writes that table directly every frame
---// while Shift is held: int_speed pinned to max (+ bonus slider), force-stop
---// fields zeroed. The game's own MainLoop consumes our values — we feed the
---// machine instead of fighting it. The velocity launch is gone (obsolete —
---// the game re-positions every frame); WalkSpeed pin stays for animations.
---//
---// v2.2: MAPPED, NOT GUESSED — the live state table was finally read correctly
---// (pairs, not rawget: rawget returns a stale snapshot from that proxy table):
---//     Humanoid.WalkSpeed = base_speed + int_speed
---//   base_speed is flat (10), int_speed ramps up to the class's sprint target
---//   over ~1-2s while Shift is held. Verified live: base 30 + int 30 produced a
---//   real WalkSpeed of 60 and real movement at 64 st/s, and the jump happened
---//   the instant the write landed — so int_speed IS the knob.
---// Why the previous versions could never work, measured instead of guessed:
---//   * v1.5-v2.0 wrote Humanoid.WalkSpeed. The game RECOMPUTES WalkSpeed from
---//     its state table every frame, so our value never reached physics. Proven:
---//     WalkSpeed sat at 24 while the character's own velocity stayed at 18.
---//   * v2.1 wrote the right field on the wrong phase (Heartbeat, which the
---//     game's own recompute overwrites) with a fabricated constant
---//     (INT_MAX 6 + bonus 10 = 16) that happened to equal the natural end of the
---//     ramp — so it did nothing except add a +10 st/s boost.
---// v2.2 writes int_speed = (the game's OWN learned sprint top - base_speed) on
---// RunService.PreSimulation, the last phase before the physics step, so the value
---// is the one physics consumes. The top is learned passively from WalkSpeed
---// whenever we are not overriding, so the player's speed is never altered — only
---// the ~1-2s ramp is removed. The bonus slider is gone: no speed changes.
+--// v3.0: COMBAT — aimbot + silent aim + tracer. See the COMBAT section below.
 --
 --// loadstring entry, cache-proof (Synapse caches HttpGet per URL, so a plain URL
 --// can hand you an old build no matter what we push):
@@ -134,7 +54,7 @@ if getgenv().HamasGD_Shutdown then pcall(getgenv().HamasGD_Shutdown) end
 local okCtx, ctx = pcall(function()
     return Base:Create({
         GameName = "Gravedigger",
-        Version = "2.4",
+        Version = "3.0",
         Debug = true,
         Tabs = {
             { Title = "Main",     Icon = "home" },
@@ -393,360 +313,8 @@ end
 --// debug handle for remote inspection through the executor bridge
 getgenv().HamasGD_ESP = ESP
 
---// ===========================================================================
---// v2.4 NO-ACCELERATION SPRINT (measured + self-verifying)
---//   * speed model: Humanoid.WalkSpeed = base_speed + int_speed, and int_speed
---//     IS the ramp — so the ramp is removed by writing int_speed
---//   * written on RunService.PreSimulation: the last phase before the physics
---//     step, so this is the value the physics actually consumes
---//   * the table is identified by proof (base + int == live WalkSpeed), because
---//     the heap holds several stale copies carrying the same 62 keys
---//   * LEARNING READS WalkSpeed ONLY. Reading int_speed back returns our own
---//     written value, so a table-fed learner eats itself — that is what froze
---//     the held speed at 11.7 for 61 seconds in the recorded trace. The top is
---//     the plateau of the game's own sprint (stable 0.25s), measured from
---//     WalkSpeed, which the trace shows is honest
---//   * the number written is top - resting, i.e. the player's OWN top speed, so
---//     nothing is boosted and nothing is capped below what the game gives him
---//   * sprint_block / sprint_force_stop / sprint_wall_stopper zeroed while held
---//     so the game cannot kill a sprint mid-run
---//   * real Shift key tracking (InputBegan/InputEnded, chat-aware)
---//   * EVERYTHING logged: console + debug log + getgenv().HamasGD_Sprint.Log
---// ===========================================================================
-local Sprint = { Enabled = false, ShiftDown = false, TopWS = nil, Writes = 0 }
---// keep the measured top across re-executes (same Roblox session)
-do
-    local prev = getgenv().HamasGD_Sprint
-    if prev and prev.TopWS then Sprint.TopWS = prev.TopWS end
-end
-getgenv().HamasGD_Sprint = Sprint
 
-local sprintLog = {}
-Sprint.Log = sprintLog
-local function sLog(...)
-    local parts = {}
-    for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
-    local line = os.date("%H:%M:%S") .. " " .. table.concat(parts, " ")
-    sprintLog[#sprintLog + 1] = line
-    if #sprintLog > 40 then table.remove(sprintLog, 1) end
-    print("[Hamas-Sprint] " .. table.concat(parts, " "))
-    if Debug then Debug:Log("[Sprint]", table.concat(parts, " ")) end
-end
 
-local function sprintAllowed()
-    if not Sprint.Enabled then return false, "disabled" end
-    if UserInputService:GetFocusedTextBox() then return false, "chat-focus" end
-    local ch = LocalPlayer.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hum then return false, "no-humanoid (dead/menu?)" end
-    if hum.Health <= 0 then return false, "dead (hp 0)" end
-    return true, hum
-end
-
---// v1.5-v2.1 removed from here: the per-character WalkSpeed watchdog and the
---// Heartbeat enforcer. Both were proven useless live — the game recomputes
---// WalkSpeed from its own state table every frame, so pinning WalkSpeed never
---// reached the physics step (measured: WalkSpeed held at 24, real velocity 18).
-
---// real Shift tracking (gameProcessed = typing in chat / UI has focus)
-conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
-    if input.KeyCode == Enum.KeyCode.LeftShift then
-        Sprint.ShiftDown = not gp
-        if Sprint.Enabled then
-            sLog("Shift DOWN", Sprint.TopWS and (("-> straight to %.2f st/s"):format(Sprint.TopWS))
-                or "-> measuring your sprint top on this one")
-        end
-    end
-end)
-conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
-    if input.KeyCode == Enum.KeyCode.LeftShift then
-        Sprint.ShiftDown = false
-    end
-end)
-
---// ---------------------------------------------------------------------------
---// THE STATE TABLE — measured, not guessed:
---//   * the game computes Humanoid.WalkSpeed = base_speed + int_speed, where
---//     base_speed is flat (10) and int_speed IS the sprint ramp (0 -> target).
---//   * SEVERAL tables in the heap carry the same 62 sprint keys — stale copies
---//     from earlier lives/loadouts (observed side by side: int 0/mod 0 for the
---//     live one, int 7.5/mod 2.5 and int 9/mod 0.5 for dead copies). Identity
---//     therefore has to be PROVEN: only the player's own copy satisfies
---//     base_speed + int_speed == his WalkSpeed. That check is the whole
---//     difference between writing his state and writing a dead copy.
---//   * read with pairs(): rawget()/indexing on these tables returns nil or a
---//     stale snapshot (it reported int_speed 9 while WalkSpeed ramped 19.4->26.5).
---//     rawset() writes do reach the live state.
---//   * getgc() returns a table WITH HOLES: ipairs() stops after ~2 entries, which
---//     is exactly why the old finder grabbed a look-alike.
---// ---------------------------------------------------------------------------
-local SIG = { "sprint_ticker", "sprinting_max_speed", "int_speed", "base_speed",
-    "speed_mod", "sprinting", "sprint_block", "sprint_force_stop" }
-
-local function signatureHits(t)
-    local have = {}
-    local ok = pcall(function()
-        for k in pairs(t) do if type(k) == "string" then have[k] = true end end
-    end)
-    if not ok then return 0 end
-    local hits = 0
-    for _, k in ipairs(SIG) do if have[k] then hits = hits + 1 end end
-    return hits
-end
-
---// base / int / mod / sprinting, read together
-local function stateRead(t)
-    local b, i, m, sp
-    pcall(function()
-        for k, v in pairs(t) do
-            if k == "base_speed" then b = tonumber(v)
-            elseif k == "int_speed" then i = tonumber(v)
-            elseif k == "speed_mod" then m = tonumber(v)
-            elseif k == "sprinting" then sp = v end
-        end
-    end)
-    return b, i, m, sp
-end
-
---// hunt for the LIVE copy: the one whose base + int equals the real WalkSpeed
-local function findLiveState(ws)
-    if not ws or ws <= 0 then return nil end
-    local seen = {}
-    local gc = getgc(true)
-    for idx = 1, #gc do                      -- index loop: getgc() has holes
-        local f = gc[idx]
-        if type(f) == "function" then
-            local ok, uvs = pcall(getupvalues, f)
-            if ok and uvs then
-                for _, v in ipairs(uvs) do
-                    if typeof(v) == "table" and not seen[v] then
-                        seen[v] = true
-                        if signatureHits(v) >= 7 then
-                            local b, i = stateRead(v)
-                            if b and i and math.abs((b + i) - ws) < 1.5 then
-                                return v, b, i
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
-
-Sprint.gdState = nil
---// re-hunting is a full heap scan, so it is throttled; between hunts the cached
---// table is validated every frame against WalkSpeed instead
-local function refreshState(ws, force)
-    local now = os.clock()
-    if not force and Sprint.huntAt and now - Sprint.huntAt < 2 then return Sprint.gdState end
-    Sprint.huntAt = now
-    local st, b, i = findLiveState(ws)
-    if st then
-        if st ~= Sprint.gdState then
-            Sprint.gdState = st
-            sLog(("live state table found (base %.1f + int %.1f == WalkSpeed %.1f)"):format(b, i, ws))
-        end
-        return st
-    end
-    return nil --// never write an unverified table
-end
-
---// THE FIX: RunService.PreSimulation fires immediately before the physics step,
---// so whatever is written here is what the character actually moves with. Every
---// version before this one wrote on Heartbeat/Stepped and lost that race.
-conns[#conns + 1] = RunService.PreSimulation:Connect(function()
-    local ch = LocalPlayer.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-
-    local allowed, why = sprintAllowed()
-    if not allowed then
-        if why == "disabled" then
-            Sprint.lastBlock = nil
-        elseif Sprint.ShiftDown and why ~= Sprint.lastBlock then
-            Sprint.lastBlock = why
-            sLog("Shift held but sprint BLOCKED:", why)
-        end
-    end
-
-    if hum.Health <= 0 then
-        Sprint.gdState = nil --// dead: this life's table is about to go stale
-        Sprint.RestInt = nil --// and this belongs to that life
-        return
-    end
-
-    local ws = hum.WalkSpeed
-    local now = os.clock()
-    Sprint.holdNow = false --// set again below only while we are actually holding
-
-    --// ---------------------------------------------------------------------
-    --// LEARNING USES WalkSpeed, NEVER THIS TABLE. Reading int_speed back hands
-    --// us our OWN written value, so a table-fed learner eats itself: measured, it
-    --// froze the held top at int_speed 1.67 (WalkSpeed 11.7) for 61 seconds while
-    --// the player's real sprint top was 17.6. WalkSpeed is a real property and the
-    --// trace proves it is honest:
-    --//   resting WalkSpeed == base_speed,  plateau WalkSpeed == the sprint top
-    --// ---------------------------------------------------------------------
-    local st = Sprint.gdState
-    local smod
-
-    --// verify the cached table ONLY while the key is up. Checking during a sprint
-    --// is what kept throwing the table away: its reads lag the game's own ramp, so
-    --// base + int does not equal WalkSpeed for a few frames and the check panicked.
-    if st and not Sprint.ShiftDown then
-        local base, int, m = stateRead(st)
-        smod = m
-        if base and int and math.abs((base + int) - ws) < 1.5 then
-            Sprint.badChecks = 0
-        else
-            Sprint.badChecks = (Sprint.badChecks or 0) + 1
-            if Sprint.badChecks > 30 then
-                Sprint.gdState, st = nil, nil
-                sLog("state table stopped matching — hunting a replacement")
-            end
-        end
-    elseif st then
-        local _, _, m = stateRead(st)
-        smod = m
-    end
-    --// hunting is a full heap scan, so it runs on its own thread: doing it here
-    --// would stall the frame the moment we need the table most
-    if not st and not Sprint.hunting and (not Sprint.huntAt or now - Sprint.huntAt > 2) then
-        Sprint.huntAt, Sprint.hunting = now, true
-        task.spawn(function()
-            local found = refreshState(ws)
-            Sprint.hunting = false
-            if found then sLog("state table re-acquired") end
-        end)
-    end
-
-    --// the resting WalkSpeed IS base_speed (10 on every reading). Wild jumps are
-    --// ignored so a crouch or a launch cannot move the baseline we measure from.
-    if not Sprint.ShiftDown and ws > 5 and ws < 40 then
-        if not Sprint.WalkBase or math.abs(ws - Sprint.WalkBase) < 3 then
-            Sprint.WalkBase = ws
-        end
-    end
-
-    --// a loadout swap changes the resting speed profile; confirm it over a few
-    --// frames (never mid-sprint) before throwing the measured top away
-    if not Sprint.ShiftDown and smod ~= nil then
-        if Sprint.RestMod == nil then
-            Sprint.RestMod = smod
-        elseif smod ~= Sprint.RestMod then
-            Sprint.modSeen = (Sprint.modSeen or 0) + 1
-            if Sprint.modSeen >= 3 then
-                Sprint.RestMod, Sprint.modSeen = smod, 0
-                if Sprint.TopWS then
-                    Sprint.TopWS = nil
-                    sLog("loadout speed profile changed — re-measuring your sprint top")
-                end
-            end
-        else
-            Sprint.modSeen = 0
-        end
-    end
-
-    --// canHold: only ever hold a top we measured from a real sprint
-    local canHold = allowed and st and Sprint.WalkBase
-        and Sprint.TopWS and Sprint.TopWS > Sprint.WalkBase + 1
-
-    --// measure from the game's own sprint. Nothing we write can feed this: ws
-    --// only equals a hijacked value while canHold is true. The plateau (stable
-    --// for 0.25s) is the top — acting on a rising value is what used to cap the
-    --// player below his own sprint.
-    if not canHold and Sprint.ShiftDown and Sprint.WalkBase
-        and ws > Sprint.WalkBase + 1 and ws < 40 then
-        if not Sprint.CandWS or math.abs(ws - Sprint.CandWS) > 0.15 then
-            Sprint.CandWS, Sprint.CandAt = ws, now
-        elseif now - (Sprint.CandAt or 0) > 0.25 then
-            if not Sprint.TopWS then
-                sLog(("sprint top learned: %.2f st/s (rest %.2f) — Shift now jumps straight there")
-                    :format(ws, Sprint.WalkBase))
-                canHold = true --// just measured: this press is already instant
-            end
-            if not Sprint.TopWS or ws > Sprint.TopWS + 0.05 then Sprint.TopWS = ws end
-        end
-    end
-
-    if not canHold then
-        --// GUARANTEED CLEANUP. Anything we injected must not outlive the hold, and
-        --// it must be undone on the EXACT table we wrote to — losing the cached
-        --// reference mid-burst is what used to leave the player permanently fast.
-        if Sprint.injected and Sprint.injTable then
-            local restore = Sprint.RestInt or 0
-            local okR = pcall(rawset, Sprint.injTable, "int_speed", restore)
-            if okR then Sprint.injected = false end
-        end
-        --// keep handing it back for a moment too, in case the game rewrites it
-        if st and Sprint.lastWrite and (now - Sprint.lastWrite) < 0.5 then
-            pcall(rawset, st, "int_speed", Sprint.RestInt or 0)
-        end
-        if Sprint.learnNote ~= true and Sprint.ShiftDown and allowed and not Sprint.TopWS then
-            Sprint.learnNote = true
-            sLog("measuring your sprint top on this press — every press after it is instant")
-        end
-        return
-    end
-    Sprint.learnNote = nil
-    Sprint.lastBlock = nil
-
-    --// first write of a burst: remember what to hand back. This is 0 by
-    --// construction — at rest the game leaves int_speed at 0 (resting WalkSpeed
-    --// == base_speed on every reading) — and deriving it from WalkSpeed is more
-    --// reliable than reading it back off a table whose reads can lag.
-    if not Sprint.lastWrite or now - Sprint.lastWrite > 0.4 then
-        Sprint.RestInt = 0
-        sLog(("holding: int_speed %.2f -> WalkSpeed %.2f (this loadout's own top)")
-            :format(Sprint.TopWS - Sprint.WalkBase, Sprint.TopWS))
-    end
-
-    --// exactly the player's own top speed: WalkSpeed = base_speed + int_speed
-    local target = Sprint.TopWS - Sprint.WalkBase
-
-    local ok, err = pcall(function()
-        rawset(st, "int_speed", target)   --// the game's own top, instantly
-        rawset(st, "sprint_block", false) --// no forced sprint breaks
-        rawset(st, "sprint_force_stop", 0) --// no mid-run sprint kills
-        rawset(st, "sprint_wall_stopper", 0)
-    end)
-    if not ok then
-        Sprint.gdState = nil
-        if err ~= Sprint.lastWriteErr then
-            Sprint.lastWriteErr = err
-            sLog("state write failed:", tostring(err))
-        end
-        return
-    end
-    Sprint.Writes = Sprint.Writes + 1
-    Sprint.lastWrite = now
-    Sprint.holdNow = true
-    Sprint.injTable, Sprint.injValue, Sprint.injected = st, target, true
-    if Sprint.Writes == 1 or Sprint.Writes % 300 == 0 then
-        sLog(("no-accel: int_speed %.2f -> WalkSpeed %.2f (your own top, no ramp)")
-            :format(target, Sprint.TopWS))
-    end
-end)
-
---// THE RACE, WON: the recorded trace showed WalkSpeed still ramping while we held
---// a value, i.e. the game recomputes it from its own ramp after the PreSimulation
---// pass. Re-asserting the same value on RenderStepped (the last phase of the frame)
---// makes ours the value the next physics step consumes, so the ramp has nowhere
---// left to happen.
-conns[#conns + 1] = RunService.RenderStepped:Connect(function()
-    if Sprint.holdNow and Sprint.injTable and Sprint.injValue then
-        pcall(rawset, Sprint.injTable, "int_speed", Sprint.injValue)
-    end
-end)
-
---// a new life brings a new state table; the top is kept so the first press of
---// the new life is already instant (the profile check re-learns it if it changed)
-conns[#conns + 1] = LocalPlayer.CharacterAdded:Connect(function()
-    Sprint.gdState = nil
-    Sprint.RestInt = nil
-end)
 
 local M = Tabs.Main
 M:CreateSection("Gravedigger")
@@ -789,19 +357,6 @@ local function probeDump(say)
     end
 end
 
-M:CreateSection("Movement")
-M:CreateToggle("GD_NoAccel", { Title = "No-acceleration sprint", Default = false,
-    Description = "Removes the sprint ramp only — your sprint speed is unchanged, it just arrives the instant you press Shift",
-    Callback = function(v)
-        Sprint.Enabled = v
-        if v then
-            sLog("ENABLED —", Sprint.TopWS and (("your sprint top %.2f st/s is known, Shift jumps straight to it")
-                :format(Sprint.TopWS)) or "no sprint seen yet — the next sprint measures your top, then every press is instant")
-        else
-            sLog("DISABLED")
-        end
-    end })
-
 M:CreateSection("Gravedigger")
 M:CreateButton({
     Title = "Model probe (console + log)",
@@ -833,16 +388,435 @@ getgenv().HamasGD_Probe = function()
     return n
 end
 
+--// ---------------------------------------------------------------------------
+--// Combat UI
+--// ---------------------------------------------------------------------------
+M:CreateSection("Combat — Aimbot")
+M:CreateToggle("GD_Aimbot", { Title = "Aimbot (camera)", Default = false,
+    Description = "Moves your camera onto the best enemy in your FOV. Silent aim does not need this.",
+    Callback = function(v) Combat.Aimbot = v cLog("aimbot", v and "ON" or "OFF") end })
+
+local aimBind
+aimBind = M:AddKeybind("GD_AimKey", { Title = "Aim key", Default = Enum.KeyCode.E,
+    Description = "Click the box, then press a key or mouse button",
+    Callback = function(v) Combat.Key = v end })
+pcall(function()
+    if aimBind and aimBind.Value then Combat.Key = aimBind.Value end
+end)
+
+M:CreateDropdown("GD_AimMode", { Title = "Key mode", Options = { "Hold", "Toggle" }, Default = "Hold",
+    Callback = function(v) Combat.Mode = v end })
+
+M:CreateSlider("GD_AimFov", { Title = "Aim FOV", Default = 90, Min = 1, Max = 360, Rounding = 0,
+    Description = "How far off-centre a target may be (degrees, full width)",
+    Callback = function(v) Combat.Fov = v end })
+
+M:CreateSlider("GD_AimSmooth", { Title = "Smoothing", Default = 0.2, Min = 0.02, Max = 1, Rounding = 2,
+    Description = "Lower snaps faster, higher is smoother",
+    Callback = function(v) Combat.Smooth = v end })
+
+M:CreateSlider("GD_AimDist", { Title = "Max distance", Default = 700, Min = 50, Max = 3000, Rounding = 0,
+    Callback = function(v) Combat.MaxDist = v end })
+
+M:CreateDropdown("GD_AimPart", { Title = "Aim part",
+    Options = { "Head", "UpperTorso", "HumanoidRootPart", "Nearest" }, Default = "Head",
+    Callback = function(v) Combat.Part = v end })
+
+M:CreateDropdown("GD_AimPriority", { Title = "Priority", Options = { "Crosshair", "Distance" },
+    Default = "Crosshair", Callback = function(v) Combat.Priority = v end })
+
+M:CreateToggle("GD_AimVisible", { Title = "Visible only", Default = true,
+    Description = "Skip enemies behind cover (raycast line of sight)",
+    Callback = function(v) Combat.Visible = v end })
+
+M:CreateSection("Combat — Silent aim")
+M:CreateToggle("GD_Silent", { Title = "Silent aim", Default = false,
+    Description = "Sends your bullets to the enemy without moving your camera",
+    Callback = function(v)
+        Combat.Silent = v
+        if v then
+            if installSilentHook() then
+                cLog("silent aim ON — holding the top of the target")
+            else
+                Combat.Silent = false
+            end
+        else
+            cLog("silent aim OFF")
+        end
+    end })
+
+M:CreateToggle("GD_SilentAlways", { Title = "Silent aim always on", Default = true,
+    Description = "Redirect shots without holding the aim key",
+    Callback = function(v) Combat.SilentAlways = v end })
+
+M:CreateDropdown("GD_SilentPart", { Title = "Silent aim part",
+    Options = { "Head", "UpperTorso", "HumanoidRootPart", "Nearest" }, Default = "Head",
+    Description = "Nearest is the most forgiving: it uses whichever part of the enemy is closest to you",
+    Callback = function(v) Combat.SilentPart = v end })
+
+M:CreateToggle("GD_Tracer", { Title = "Trace line", Default = true,
+    Description = "Neon line from your gun to whoever each shot was sent to",
+    Callback = function(v) Combat.Tracer = v end })
+
+M:CreateToggle("GD_TracerAlways", { Title = "Trace line while locked", Default = false,
+    Description = "Show the line continuously while silent aim has a target",
+    Callback = function(v) Combat.TracerAlways = v end })
+
+M:CreateSlider("GD_TracerTime", { Title = "Trace lifetime", Default = 0.4, Min = 0.05, Max = 3, Rounding = 2,
+    Description = "Seconds each trace line stays on screen",
+    Callback = function(v) Combat.TracerTime = v end })
+
+pcall(function()
+    M:CreateColorpicker("GD_TracerColor", { Title = "Trace colour",
+        Default = Color3.fromRGB(120, 255, 140),
+        Callback = function(v) Combat.TracerColor = v end })
+end)
+
+M:CreateButton({
+    Title = "Clear trace lines",
+    Description = "Removes every trace line currently in the world",
+    Callback = function()
+        local t = workspace:FindFirstChild("HamasTracers")
+        if t then pcall(function() t:Destroy() end) end
+    end,
+})
+
+M:CreateButton({
+    Title = "Show current target (console + log)",
+    Description = "Prints the enemy aim and silent aim have locked right now",
+    Callback = function()
+        cLog("aim target:", Combat.Target and Combat.Target.Name or "none",
+            "| silent target:", Combat.SilentTarget and Combat.SilentTarget.Name or "none",
+            "| shots redirected:", tostring(Combat.Shots),
+            "| hook:", Combat.Hook and "installed" or "not installed")
+    end,
+})
+
 --// ===========================================================================
+--// v3.0 COMBAT — aimbot + SILENT AIM + tracer
+--// ===========================================================================
+--// Targeting is shared: myEnemies() already returns only VERIFIED live enemy
+--// fighters (live-player name match, positive Health, ragdolls/corpses/team
+--// excluded), so aim and silent aim always agree on who is a valid target.
+--//
+--// SILENT AIM is a ray redirect, not a camera move: the game decides a shot with
+--// a ray it builds from the camera, so we install ONE narrow __namecall hook and
+--// rewrite only the calls that BUILD that ray (ViewportPointToRay /
+--// ScreenPointToRay) or PERFORM it (Raycast / FindPartOnRay*). Your camera never
+--// moves, so nothing about your view gives it away. Every other call falls
+--// straight through the hook — it never yields, and any failure inside our branch
+--// falls back to the original call.
+--//
+--// TRACER: every shot silent aim redirects draws a client-only neon beam from
+--// your muzzle to the enemy it was sent to, so you can see exactly who it picked.
+--// ===========================================================================
+local Combat = {
+    Aimbot = false, Silent = false, SilentAlways = true,
+    Key = Enum.KeyCode.E, Mode = "Hold", KeyDown = false, Toggled = false, Active = false,
+    Fov = 90, MaxDist = 700, Smooth = 0.2, Part = "Head", SilentPart = "Head",
+    Visible = true, Priority = "Crosshair", DrawFov = false,
+    SilentMethod = "Camera ray", Hitbox = 0,
+    Tracer = true, TracerAlways = false, TracerColor = Color3.fromRGB(120, 255, 140),
+    TracerTime = 0.4,
+    Target = nil, TargetPart = nil, SilentTarget = nil, SilentPart2 = nil,
+    Shots = 0, Writes = 0, Hook = nil,
+}
+getgenv().HamasGD_Combat = Combat
+
+do
+    local buf = {}
+    Combat.Log = buf
+    Combat.log = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+        buf[#buf + 1] = os.date("%H:%M:%S") .. " " .. table.concat(parts, " ")
+        if #buf > 30 then table.remove(buf, 1) end
+        print("[Hamas-Aim] " .. table.concat(parts, " "))
+        if Debug then Debug:Log("[Aim]", table.concat(parts, " ")) end
+    end
+end
+local cLog = Combat.log
+
+local cam = workspace.CurrentCamera
+
+--// pick the part we aim at. "Nearest" = the closest base part on that fighter,
+--// which is the most forgiving target for silent aim.
+local function partFor(m, which)
+    if not m or not m.Parent then return nil end
+    if which == "Nearest" then
+        local camPos = cam.CFrame.Position
+        local best, bestD
+        for _, d in ipairs(m:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local dist = (d.Position - camPos).Magnitude
+                if not bestD or dist < bestD then best, bestD = d, dist end
+            end
+        end
+        return best or modelRoot(m)
+    end
+    return m:FindFirstChild(which) or m:FindFirstChild("Head") or modelRoot(m)
+end
+
+--// true when nothing solid is between the camera and that part
+local function losClear(fromPos, part, m)
+    local ignore = {}
+    if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+    if m then ignore[#ignore + 1] = m end
+    if #ignore == 0 then return true end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = ignore
+    params.IgnoreWater = true
+    return workspace:Raycast(fromPos, part.Position - fromPos, params) == nil
+end
+
+local function fovAngle(part)
+    local camPos = cam.CFrame.Position
+    local to = part.Position - camPos
+    if to.Magnitude < 0.05 then return 0 end
+    return math.deg(math.acos(math.clamp(cam.CFrame.LookVector:Dot(to.Unit), -1, 1)))
+end
+
+--// the one and only target chooser: FOV -> line of sight -> priority
+local function pickTarget(partName, requireKey)
+    if requireKey and not Combat.Active then return nil end
+    local camPos = cam.CFrame.Position
+    local list = myEnemies(camPos, Combat.MaxDist)
+    local best, bestScore
+    for _, e in ipairs(list) do
+        local m = e.inst
+        local part = partFor(m, partName)
+        if part then
+            local ang = fovAngle(part)
+            if ang <= Combat.Fov * 0.5 and (not Combat.Visible or losClear(camPos, part, m)) then
+                local score = (Combat.Priority == "Distance") and e.d or ang
+                if not bestScore or score < bestScore then
+                    best, bestScore = { m = m, part = part, d = e.d, ang = ang }, score
+                end
+            end
+        end
+    end
+    return best
+end
+
+--// ---------------------------------------------------------------------------
+--// tracer: client-only neon beam, muzzle -> the enemy the shot was sent to
+--// ---------------------------------------------------------------------------
+local function tracerFolder()
+    local f = workspace:FindFirstChild("HamasTracers")
+    if not f then
+        f = Instance.new("Folder")
+        f.Name = "HamasTracers"
+        f.Parent = workspace
+    end
+    return f
+end
+
+local function muzzlePos()
+    local ch = LocalPlayer.Character
+    if not ch then return nil end
+    local tool = ch:FindFirstChildWhichIsA("Tool")
+    local handle = tool and (tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart"))
+    if handle then return handle.Position end
+    local hand = ch:FindFirstChild("RightHand") or ch:FindFirstChild("Right Arm") or modelRoot(ch)
+    return hand and hand.Position or nil
+end
+
+local function drawTracer(toPos)
+    local from = muzzlePos()
+    if not from or not toPos then return end
+    local dist = (toPos - from).Magnitude
+    if dist < 1 then return end
+    local p = Instance.new("Part")
+    p.Name = "HamasTracer"
+    p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = true, false, false, false, false
+    p.Material = Enum.Material.Neon
+    p.Color = Combat.TracerColor
+    p.Transparency = 0.1
+    p.Size = Vector3.new(0.09, 0.09, dist)
+    p.CFrame = CFrame.lookAt((from + toPos) * 0.5, toPos)
+    p.Parent = tracerFolder()
+    task.delay(tonumber(Combat.TracerTime) or 0.4, function() pcall(function() p:Destroy() end) end)
+end
+
+--// ---------------------------------------------------------------------------
+--// silent aim: rewrite the ray the game builds for a shot
+--// ---------------------------------------------------------------------------
+local SILENT_METHODS = {
+    ViewportPointToRay = true, ScreenPointToRay = true,
+    Raycast = true, FindPartOnRay = true,
+    FindPartOnRayWithIgnoreList = true, FindPartOnRayWithWhitelist = true,
+}
+
+--// What silent aim must do depends on the call:
+--//   * ViewportPointToRay / ScreenPointToRay BUILD the aim ray. These take screen
+--//     pixels, so we cannot "call through with a position" — we RETURN our own
+--//     Ray towards the target instead of calling the original at all. That single
+--//     substitution redirects every raycast the game later derives from it, which
+--//     is what makes it work across different guns.
+--//   * Raycast / FindPartOnRay* PERFORM a ray we can correct: call the original
+--//     with the same origin/params and a direction pointed at the target, so
+--//     range, filters and the game's own hit logic all still apply.
+--// Returns (result, redirected).
+local function silentRedirect(old, method, self, part, ...)
+    if method == "ViewportPointToRay" or method == "ScreenPointToRay" then
+        local origin = self.CFrame.Position
+        local dir = part.Position - origin
+        if dir.Magnitude < 0.05 then return nil, false end
+        return Ray.new(origin, dir.Unit * 5000), true
+    elseif method == "Raycast" then
+        local o, dir, params = ...
+        if typeof(o) == "Vector3" and typeof(dir) == "Vector3" then
+            local goal = part.Position - o
+            if goal.Magnitude < 0.05 then return nil, false end
+            return old(self, o, goal.Unit * dir.Magnitude, params), true
+        end
+    else
+        local ray, a, b, c = ...
+        if typeof(ray) == "Ray" then
+            local goal = part.Position - ray.Origin
+            if goal.Magnitude < 0.05 then return nil, false end
+            return old(self, Ray.new(ray.Origin, goal.Unit * ray.Direction.Magnitude), a, b, c), true
+        end
+    end
+    return nil, false
+end
+
+local lastTracerAt = 0
+
+local function installSilentHook()
+    if Combat.Hook then return true end
+    local okMt, mt = pcall(getrawmetatable, game)
+    if not okMt or not mt or not mt.__namecall then
+        cLog("silent aim: no __namecall to hook on this executor")
+        return false
+    end
+    local old = mt.__namecall
+    Combat.Hook = old
+    local hooked = newcclosure(function(self, ...)
+        if Combat.Silent and Combat.SilentPart2 then
+            local method = getnamecallmethod()
+            if SILENT_METHODS[method] then
+                local ok, res, did = pcall(silentRedirect, old, method, self, Combat.SilentPart2, ...)
+                if ok and did then
+                    Combat.Shots = Combat.Shots + 1
+                    local now = os.clock()
+                    if Combat.Tracer and now - lastTracerAt > 0.05 then
+                        lastTracerAt = now
+                        pcall(drawTracer, Combat.SilentPart2.Position)
+                    end
+                    local name = Combat.SilentTarget and Combat.SilentTarget.Name
+                    if Combat.LastName ~= name then
+                        Combat.LastName = name
+                        cLog("silent aim -> " .. tostring(name) .. " via " .. method)
+                    end
+                    return res
+                end
+            end
+        end
+        return old(self, ...)
+    end)
+    local okSet = pcall(function()
+        setreadonly(mt, false)
+        mt.__namecall = hooked
+        setreadonly(mt, true)
+    end)
+    if not okSet then
+        Combat.Hook = nil
+        cLog("silent aim: could not write __namecall (metatable is locked)")
+        return false
+    end
+    return true
+end
+
+local function removeSilentHook()
+    if not Combat.Hook then return end
+    pcall(function()
+        local mt = getrawmetatable(game)
+        setreadonly(mt, false)
+        mt.__namecall = Combat.Hook
+        setreadonly(mt, true)
+    end)
+    Combat.Hook = nil
+end
+
+--// ---------------------------------------------------------------------------
+--// per-frame: resolve the target, drive the camera (aimbot only), feed silent aim
+--// ---------------------------------------------------------------------------
+local lastPreview = 0
+conns[#conns + 1] = RunService.RenderStepped:Connect(function(dt)
+    Combat.Active = (Combat.Mode == "Toggle") and Combat.Toggled or Combat.KeyDown
+
+    local typing = UserInputService:GetFocusedTextBox() ~= nil
+    local wantAim = Combat.Aimbot and Combat.Active and not typing
+    local wantSilent = Combat.Silent and (Combat.SilentAlways or Combat.Active) and not typing
+
+    Combat.Target, Combat.TargetPart = nil, nil
+    Combat.SilentTarget, Combat.SilentPart2 = nil, nil
+
+    if wantAim then
+        local t = pickTarget(Combat.Part, false)
+        if t then
+            Combat.Target, Combat.TargetPart = t.m, t.part
+        end
+    end
+    if wantSilent then
+        local t = pickTarget(Combat.SilentPart, false)
+        if t then
+            Combat.SilentTarget, Combat.SilentPart2 = t.m, t.part
+        end
+    end
+
+    --// aimbot cam
+    if Combat.Aimbot and Combat.Active and not typing and Combat.TargetPart then
+        local goal = CFrame.lookAt(cam.CFrame.Position, Combat.TargetPart.Position)
+        local alpha = math.clamp(dt / math.max(Combat.Smooth, 0.02), 0.02, 1)
+        cam.CFrame = cam.CFrame:Lerp(goal, alpha)
+    end
+
+    --// tracer preview: while a silent target is locked, show the line it will use
+    if Combat.Tracer and Combat.TracerAlways and Combat.SilentPart2 then
+        local now = os.clock()
+        if now - lastPreview > 0.1 then
+            lastPreview = now
+            drawTracer(Combat.SilentPart2.Position)
+        end
+    end
+end)
+
+--// ---------------------------------------------------------------------------
+--// key tracking for the aim key (hold or toggle), chat-safe
+--// ---------------------------------------------------------------------------
+local function isAimInput(input)
+    return input.KeyCode == Combat.Key or input.UserInputType == Combat.Key
+end
+conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
+    if gp or not isAimInput(input) then return end
+    if Combat.Mode == "Toggle" then
+        Combat.Toggled = not Combat.Toggled
+    else
+        Combat.KeyDown = true
+    end
+end)
+conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
+    if not isAimInput(input) then return end
+    if Combat.Mode ~= "Toggle" then Combat.KeyDown = false end
+end)
+
+--// ---------------------------------------------------------------------------
+--// v3.0
 --// shutdown
 --// ===========================================================================
 getgenv().HamasGD_Shutdown = function()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     conns = {}
+    removeSilentHook()
     pcall(function() ESP:Shutdown() end)
+    local t = workspace:FindFirstChild("HamasTracers")
+    if t then pcall(function() t:Destroy() end) end
 end
 
-print("[Hamas] Gravedigger v2.4 loaded, place:", game.PlaceId)
+print("[Hamas] Gravedigger v3.0 loaded, place:", game.PlaceId)
 pcall(function()
-    Fluent:Notify({ Title = "HamasClient",        Content = "Gravedigger v2.4 — sprint ramp removed", Duration = 3 })
+    Fluent:Notify({ Title = "HamasClient",        Content = "Gravedigger v3.0 — aimbot + silent aim", Duration = 3 })
 end)
